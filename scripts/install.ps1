@@ -59,5 +59,24 @@ Copy-Item -Force $Built $Installed
 $reg = Start-Process -FilePath $Installed -ArgumentList '--register-autostart' -Wait -PassThru -NoNewWindow
 if ($reg.ExitCode -ne 0) { throw "--register-autostart failed with exit code $($reg.ExitCode)" }
 
+# User PATH, read and written raw: [Environment]::GetEnvironmentVariable expands
+# %VAR% entries, and writing that back would silently flatten them for good.
+$envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+try {
+    $raw = [string]$envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $entries = @($raw -split ';' | Where-Object { $_ })
+    if (-not ($entries | Where-Object { $_.TrimEnd('\') -ieq $InstallDir })) {
+        $kind = if ($raw) { $envKey.GetValueKind('Path') } else { [Microsoft.Win32.RegistryValueKind]::ExpandString }
+        $envKey.SetValue('Path', (($entries + $InstallDir) -join ';'), $kind)
+        # Tell Explorer so new shells see it without signing out.
+        [Environment]::SetEnvironmentVariable('ZCR_PATH_REFRESH', '1', 'User')
+        [Environment]::SetEnvironmentVariable('ZCR_PATH_REFRESH', $null, 'User')
+        Write-Host "Added $InstallDir to the user PATH. Open a new shell to pick it up."
+    }
+}
+finally {
+    $envKey.Close()
+}
+
 Start-Process -FilePath $Installed
 Write-Host "Installed $Installed and registered it to start at login." -ForegroundColor Green
