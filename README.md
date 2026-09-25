@@ -110,7 +110,8 @@ cmake --build --preset release
 ```
 
 `scripts\install.ps1` builds, signs, copies the exe to
-`%LOCALAPPDATA%\Programs\ZCR`, registers it to start at sign-in and starts it.
+`%LOCALAPPDATA%\Programs\ZCR`, adds that folder to the user PATH, registers it
+to start at sign-in and starts it.
 Pass `-NoSign` on a machine without the signing credentials.
 
 ## License
