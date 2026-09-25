@@ -1,0 +1,47 @@
+// Generated from res/zcr.rc.in by configure_file. Edit the .in file.
+// Every version field derives from cmake/ZcrVersion.cmake.
+#include <windows.h>
+
+#include "resource.h"
+
+// IDI_APPICON must stay the lowest ICON id: Explorer shows the first icon in the
+// file as the exe's own.
+IDI_APPICON   ICON "@ZCR_ASSETS@/zcr.ico"
+IDI_TRAY_IDLE ICON "@ZCR_ASSETS@/tray_idle.ico"
+IDI_TRAY_REC  ICON "@ZCR_ASSETS@/tray_rec.ico"
+IDI_TRAY_ERR  ICON "@ZCR_ASSETS@/tray_err.ico"
+
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION    @ZCR_VERSION_RC@
+    PRODUCTVERSION @ZCR_VERSION_RC@
+    FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+    FILEFLAGS      VS_FF_DEBUG
+#else
+    FILEFLAGS      0x0L
+#endif
+    FILEOS         VOS_NT_WINDOWS32
+    FILETYPE       VFT_APP
+    FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "@ZCR_COMPANY@"
+            VALUE "FileDescription",  "ZCR Zero Copy Recorder"
+            VALUE "FileVersion",      "@ZCR_VERSION_RC_STR@"
+            VALUE "InternalName",     "zcr"
+            VALUE "LegalCopyright",   "@ZCR_COPYRIGHT@"
+            VALUE "OriginalFilename", "zcr.exe"
+            VALUE "ProductName",      "@ZCR_PRODUCT@"
+            VALUE "ProductVersion",   "@ZCR_VERSION_RC_STR@"
+        END
+    END
+
+    BLOCK "VarFileInfo"
+    BEGIN
+        // US English, Unicode. Must agree with the StringFileInfo block above.
+        VALUE "Translation", 0x409, 1200
+    END
+END

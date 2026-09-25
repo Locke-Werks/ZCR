@@ -1,0 +1,9 @@
+build/
+out/
+dist/
+stage/
+*.user
+tools/
+*.ico.bak
+.reliquary-project
+tests/out/

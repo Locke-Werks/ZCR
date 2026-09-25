@@ -1,0 +1,49 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "installDir": "${sourceDir}/build/${presetName}/install",
+      "cacheVariables": {
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+      }
+    },
+    {
+      "name": "msvc",
+      "hidden": true,
+      "inherits": "base",
+      "description": "No generator named on purpose: CMake's Windows default is the newest installed Visual Studio, which finds its own toolset without vcvars. Pinning a year breaks when a runner moves on."
+    },
+    {
+      "name": "vs",
+      "displayName": "Visual Studio, whatever is installed",
+      "inherits": "msvc"
+    },
+    {
+      "name": "ci",
+      "displayName": "CI: warnings are errors",
+      "inherits": "msvc",
+      "cacheVariables": {
+        "ZCR_WERROR": "ON",
+        "ZCR_HARDENING": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "The shippable binary",
+      "inherits": "msvc",
+      "cacheVariables": {
+        "ZCR_WERROR": "ON",
+        "ZCR_HARDENING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "vs", "configurePreset": "vs", "configuration": "Debug" },
+    { "name": "ci", "configurePreset": "ci", "configuration": "RelWithDebInfo" },
+    { "name": "release", "configurePreset": "release", "configuration": "Release" }
+  ]
+}
