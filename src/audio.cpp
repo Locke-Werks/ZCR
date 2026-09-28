@@ -882,6 +882,8 @@ struct AudioSource::Impl {
     int64_t detach_sample = 0;
     double detach_deadline = 0.0;
     uint64_t frames_out = 0;
+    uint64_t frames_in = 0;           // frames fed this segment, to pad a restart
+    ULONGLONG next_encoder_retry = 0;
     bool encoder_failed_logged = false;
 
     std::vector<int16_t> packet;
@@ -1105,12 +1107,41 @@ struct AudioSource::Impl {
             pcm.resize(pcm.size() + static_cast<size_t>(gap) * channels, int16_t{0});
             return;
         }
+        // The pass may have been suspended anywhere, not just in its wait, so
+        // a long gap asks again whether it is a sleep. If it is, it must be
+        // skipped here: encoding it would put hours of silence into the file.
+        if (SleptSinceLastCheck()) {
+            SkipSleep(target);
+            return;
+        }
         // A long gap (a device reopen that blocked, a starved thread) is not
         // materialized: the encoder reads anything before pcm_start as silence,
         // so encode what is buffered and move the start past the gap.
         EncodeAvailable();
         pcm.clear();
         pcm_start = target;
+    }
+
+    /// QPC counts through sleep and hibernate; the unbiased interrupt time does
+    /// not. Their difference since the last check is exactly how long the
+    /// machine was down, which no amount of thread starvation can fake.
+    bool SleptSinceLastCheck()
+    {
+        const double now = QpcSeconds();
+        ULONGLONG unbiased = 0;
+        QueryUnbiasedInterruptTime(&unbiased);
+        const bool first = last_loop_qpc == 0.0;
+        const double slept =
+            first ? 0.0
+                  : (now - last_loop_qpc)
+                        - static_cast<double>(unbiased - last_loop_unbiased) / 1e7;
+        last_loop_qpc = now;
+        last_loop_unbiased = unbiased;
+        if (slept > kSleepSeconds) {
+            log::Writef(L"audio: %s: the machine slept %.1f s, skipping it", Tag(), slept);
+            return true;
+        }
+        return false;
     }
 
     /// The machine slept. The video pacer skips a sleep instead of filling it,
@@ -1249,8 +1280,9 @@ struct AudioSource::Impl {
                         static_cast<size_t>(to - from) * channels * sizeof(int16_t));
         }
         enc_pos += kFrame;
+        ++frames_in;
 
-        if (!encoder.IsOpen()) {
+        if (!encoder.IsOpen() && !RestartEncoder()) {
             return;
         }
         std::wstring error;
@@ -1264,10 +1296,43 @@ struct AudioSource::Impl {
                             error.c_str());
                 encoder_failed_logged = true;
             }
-            if (!encoder.Open(channels, bytes_per_second, error)) {
-                log::Writef(L"audio: %s encoder restart failed: %s", Tag(), error.c_str());
+            encoder.Close();
+            RestartEncoder();
+        }
+    }
+
+    /// Opens a fresh encoder mid-segment and pads it back into place. The old
+    /// one took the frames it was still holding with it, plus any fed while no
+    /// encoder was open, and the muxer places frames back to back, so without
+    /// the padding every later frame would play that many frames early.
+    /// Attempts are at most once a second, since a failing open is not cheap.
+    bool RestartEncoder()
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (now < next_encoder_retry) {
+            return false;
+        }
+        next_encoder_retry = now + kReopenIntervalMs;
+        std::wstring error;
+        if (!encoder.Open(channels, bytes_per_second, error)) {
+            log::Writef(L"audio: %s encoder restart failed: %s", Tag(), error.c_str());
+            return false;
+        }
+        // frames_in already counts the frame being encoded now, which the
+        // caller feeds next; everything before it that never came out is lost.
+        const uint64_t missing = frames_in - 1 > frames_out ? frames_in - 1 - frames_out : 0;
+        const std::vector<int16_t> silence(static_cast<size_t>(kFrame) * channels, int16_t{0});
+        const FrameOut out = [this](const uint8_t* d, size_t n) { Deliver(d, n); };
+        for (uint64_t i = 0; i < missing; ++i) {
+            if (!encoder.Encode(silence.data(), out, error)) {
+                log::Writef(L"audio: %s encoder failed while padding: %s", Tag(), error.c_str());
+                encoder.Close();
+                return false;
             }
         }
+        log::Writef(L"audio: %s encoder restarted, %llu silent frame(s) keep the track aligned",
+                    Tag(), static_cast<unsigned long long>(missing));
+        return true;
     }
 
     void EncodeAvailable()
@@ -1288,6 +1353,8 @@ struct AudioSource::Impl {
         enc_pos = ToSample(origin);
         detaching = false;
         frames_out = 0;
+        frames_in = 0;
+        next_encoder_retry = 0;
         encoder_failed_logged = false;
         std::wstring error;
         // A fresh encoder per segment, so each file starts from a clean state.
@@ -1454,21 +1521,9 @@ struct AudioSource::Impl {
             }
 
             const double now = QpcSeconds();
-            ULONGLONG unbiased = 0;
-            QueryUnbiasedInterruptTime(&unbiased);
-            // QPC counts through sleep and hibernate; the unbiased interrupt
-            // time does not. Their difference is exactly how long the machine
-            // was down, which no amount of thread starvation can fake.
-            if (last_loop_qpc > 0.0) {
-                const double slept = (now - last_loop_qpc)
-                                     - static_cast<double>(unbiased - last_loop_unbiased) / 1e7;
-                if (slept > kSleepSeconds) {
-                    log::Writef(L"audio: %s: the machine slept %.1f s, skipping it", Tag(), slept);
-                    SkipSleep(ToSample(now - SilenceLag()));
-                }
+            if (SleptSinceLastCheck()) {
+                SkipSleep(ToSample(now - SilenceLag()));
             }
-            last_loop_qpc = now;
-            last_loop_unbiased = unbiased;
 
             TakeCommands(now);
 

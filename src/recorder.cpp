@@ -48,10 +48,18 @@ namespace {
 /// ever waiting at 120 fps, and costs under 100 MB of a 24 GB card.
 constexpr size_t kRingSize = 8;
 
-/// A pacer this far behind has not hiccupped, the machine slept. Catching up
-/// would mean encoding seconds of duplicate frames in a burst; resynchronizing
-/// instead leaves a gap in wall-clock terms but keeps the file sane.
+/// A sleep longer than this is skipped rather than caught up, since catching up
+/// would mean encoding the whole sleep as duplicate frames in a burst. The audio
+/// timeline skips a sleep past the same threshold (kSleepSeconds in audio.cpp),
+/// which is what keeps the two in step across one.
 constexpr double kResyncAfterSeconds = 1.0;
+
+/// An awake stall (a game holding the GPU) is caught up with repeated frames
+/// instead, because audio kept running through it and cannot be taken back; a
+/// skip there would play the stall's audio under the video that follows it.
+/// Only a machine too loaded to catch up at all falls this far behind, and then
+/// a skip is the lesser harm.
+constexpr double kAwakeResyncSeconds = 10.0;
 
 constexpr uint64_t kAacFrameSamples = 1024;
 
@@ -584,9 +592,27 @@ struct Recorder::Impl {
         double origin = QpcSeconds();
         AttachAudio(origin);
 
+        // QPC counts through sleep and hibernate and the unbiased interrupt
+        // time does not, so the difference between them is time the machine
+        // was down. It tells a sleep apart from a stall, which the lateness of
+        // the pacer alone cannot.
+        double last_qpc = origin;
+        ULONGLONG last_unbiased = 0;
+        QueryUnbiasedInterruptTime(&last_unbiased);
+
         while (!stop) {
+            const double now = QpcSeconds();
+            ULONGLONG unbiased = 0;
+            QueryUnbiasedInterruptTime(&unbiased);
+            const double slept =
+                (now - last_qpc) - static_cast<double>(unbiased - last_unbiased) / 1e7;
+            last_qpc = now;
+            last_unbiased = unbiased;
+
             const double deadline = origin + static_cast<double>(index) * period;
-            const double wait = deadline - QpcSeconds();
+            const double wait = deadline - now;
+            const bool resync = -wait > kResyncAfterSeconds
+                                && (slept > kResyncAfterSeconds || -wait > kAwakeResyncSeconds);
             if (wait > 0.0) {
                 if (timer) {
                     LARGE_INTEGER due{};
@@ -596,8 +622,10 @@ struct Recorder::Impl {
                 } else {
                     Sleep(static_cast<DWORD>(wait * 1000.0));
                 }
-            } else if (-wait > kResyncAfterSeconds) {
-                log::Writef(L"recorder: pacer %.2f s behind, resynchronizing", -wait);
+            } else if (resync) {
+                log::Writef(L"recorder: pacer %.2f s behind (%s), resynchronizing", -wait,
+                            slept > kResyncAfterSeconds ? L"the machine slept"
+                                                        : L"too loaded to catch up");
                 // Video skips the gap rather than filling it, so audio has to
                 // skip it too. Left alone it would fill the gap with silence
                 // and trail the picture by the length of the sleep from here on.
