@@ -79,7 +79,7 @@ void Emit(std::wstring_view message, bool error)
 
 } // namespace
 
-/// A caller that redirected our output (a script, a pipe, Claude's shell) hands
+/// A caller that redirected our output (a script, a pipe, an agent's shell) hands
 /// down real standard handles even though there is no console to attach to, so
 /// those are used first rather than only after a successful attach.
 static bool HasInheritedStream(bool error)
