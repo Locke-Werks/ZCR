@@ -6,6 +6,7 @@
 
 **Click to record. Click to stop. HDR that comes out the way it went in.**
 
+[![release](https://img.shields.io/github/v/release/Locke-Werks/ZCR?style=flat-square&color=d6262a)](https://github.com/Locke-Werks/ZCR/releases)
 [![license](https://img.shields.io/badge/license-GPLv3-d6262a?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2011%20%7C%20NVIDIA-d6262a?style=flat-square)](#requirements)
 
@@ -30,6 +31,14 @@ which is why recording costs a fraction of a percent of CPU.
 - A driver recent enough for NVENC API 13.1
 
 No other GPU vendor is supported.
+
+## Installing
+
+[Releases](https://github.com/Locke-Werks/ZCR/releases) has two signed builds.
+`ZCR-Setup.exe` installs for the current user without administrator rights: it
+copies ZCR to `%LOCALAPPDATA%\Programs\ZCR` and can add a Start Menu shortcut,
+add ZCR to the PATH and start it at sign-in. `zcr.exe` is the same program as a
+portable file.
 
 ## Using it
 
