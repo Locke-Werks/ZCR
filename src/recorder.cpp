@@ -179,6 +179,17 @@ struct Segment {
     std::wstring writer_error;   // written before writer_failed is set
     std::mutex mu;
     std::condition_variable cv;
+
+    // AAC frames from the audio threads, waiting for the writer thread. The
+    // audio threads only ever take this short lock. Writing into mp4 directly
+    // would park them behind a fragment write, which on a slow disk outlasts
+    // the WASAPI buffer and leaves a gap in the audio at every keyframe.
+    struct AudioFrame {
+        size_t track = 0;
+        std::vector<uint8_t> data;
+    };
+    std::mutex audio_mu;
+    std::vector<AudioFrame> audio_queue;
 };
 
 struct Recorder::Impl {
@@ -336,6 +347,8 @@ struct Recorder::Impl {
         if (segment->writer.joinable()) {
             segment->writer.join();
         }
+        // The audio sources were detached before this, so the queue is final.
+        DrainAudioQueue(*segment);
         bool ok = true;
         if (segment->writer_failed) {
             error = segment->writer_error;
@@ -356,11 +369,32 @@ struct Recorder::Impl {
         return ok;
     }
 
+    /// Moves queued audio frames into the file. Runs on the writer thread, and
+    /// once more in CloseSegment after that thread has gone. A failed write is
+    /// the disk the video side is about to report too, so it is not reported
+    /// twice.
+    static void DrainAudioQueue(Segment& s)
+    {
+        std::vector<Segment::AudioFrame> frames;
+        {
+            std::lock_guard lock(s.audio_mu);
+            frames.swap(s.audio_queue);
+        }
+        std::wstring ignored;
+        for (const auto& frame : frames) {
+            s.mp4.WriteAudioFrame(frame.track, frame.data.data(), frame.data.size(), ignored);
+        }
+    }
+
     void WriterLoop(Segment& s)
     {
         EncodedPacket packet;
         std::wstring error;
         for (;;) {
+            // Before every video sample, so a keyframe closing the fragment
+            // takes the audio that arrived with the GOP it ends. The 250 ms
+            // timeout keeps audio draining while video is stalled.
+            DrainAudioQueue(s);
             const auto result = s.encoder.Next(packet, 250, error);
             if (result == NvencEncoder::Result::Timeout) {
                 continue;
@@ -455,12 +489,11 @@ struct Recorder::Impl {
                 origin + static_cast<double>(count.load() * kAacFrameSamples) / sample_rate;
             audio[track]->Attach(
                 [s, track, &count](const uint8_t* data, size_t size) {
-                    // A failed write here is the disk the video writer is
-                    // about to report too, so it is not reported twice.
-                    std::wstring ignored;
-                    if (s->mp4.WriteAudioFrame(track, data, size, ignored)) {
-                        ++count;
+                    {
+                        std::lock_guard lock(s->audio_mu);
+                        s->audio_queue.push_back({track, {data, data + size}});
                     }
+                    ++count;
                 },
                 start);
         }

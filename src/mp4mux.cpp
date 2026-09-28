@@ -448,6 +448,7 @@ struct Mp4Writer::Impl {
         VideoFormat format;
         bool open = false;
         bool failed = false;
+        std::wstring failure;   // the first write error, reported again by every later call
 
         uint32_t sample_duration = 0;
         uint64_t mehd_value_offset = 0;
@@ -476,6 +477,7 @@ struct Mp4Writer::Impl {
             if (!WriteAll(file.Get(), data, size, code)) {
                 failed = true;
                 error = Failure(L"WriteFile", code);
+                failure = error;
                 return false;
             }
             file_size += size;
@@ -1109,7 +1111,7 @@ bool Mp4Writer::WriteAudioFrame(size_t track, const uint8_t* data, size_t size,
         return false;
     }
     if (s.failed) {
-        error = L"MP4 writer: an earlier write to " + s.path + L" failed";
+        error = s.failure;
         return false;
     }
     if (track >= s.audio.size()) {
@@ -1141,7 +1143,7 @@ bool Mp4Writer::WriteSample(const uint8_t* annexb, size_t size, bool keyframe,
         return false;
     }
     if (s.failed) {
-        error = L"MP4 writer: an earlier write to " + s.path + L" failed";
+        error = s.failure;
         return false;
     }
     if (s.sample_count == 0 && !keyframe) {
@@ -1189,8 +1191,7 @@ bool Mp4Writer::Close(std::wstring& error)
 
     bool ok = !s.failed;
     if (!ok) {
-        error = L"MP4 writer: an earlier write to " + s.path
-            + L" failed; the file ends at the last complete fragment";
+        error = s.failure + L"; the file ends at the last complete fragment";
     }
 
     if (ok) {

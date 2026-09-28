@@ -75,9 +75,10 @@ struct AudioTrackConfig {
 /// video stops producing keyframes, more than about 10 s of pending audio is
 /// written as an audio-only fragment rather than held in memory.
 ///
-/// WriteSample and Close are called from one writer thread. WriteAudioFrame is
-/// called from the audio capture threads; an internal mutex serializes all
-/// three.
+/// An internal mutex serializes every call, so any thread may call any method.
+/// It is held across a fragment write, though, so a thread that cannot afford
+/// to wait on the disk (an audio capture thread) should queue its frames and
+/// let the writer thread hand them over; the recorder does exactly that.
 class Mp4Writer {
 public:
     Mp4Writer();

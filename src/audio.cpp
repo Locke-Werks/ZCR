@@ -84,6 +84,13 @@ constexpr auto kDetachTimeout = std::chrono::milliseconds(1000);
 
 constexpr ULONGLONG kReopenIntervalMs = 1000;
 
+/// A sleep shorter than this is left to the ordinary silence fill. The same as
+/// the video pacer's resync threshold (kResyncAfterSeconds in recorder.cpp):
+/// below it the pacer catches up with repeated frames and keeps its timeline,
+/// above it the pacer skips, and audio has to make the same choice. Real sleeps
+/// are minutes, far from the boundary.
+constexpr double kSleepSeconds = 1.0;
+
 /// 192 kbps stereo, 96 kbps mono. The in-box encoder accepts only 12000,
 /// 16000, 20000 and 24000 bytes per second.
 constexpr uint32_t kDesktopBytesPerSecond = 24000;
@@ -867,6 +874,10 @@ struct AudioSource::Impl {
     bool segment = false;
     uint64_t segment_generation = 0;
     int64_t enc_pos = 0;      // next timeline sample to encode
+
+    // The previous pass of the capture loop, on both clocks, to detect a sleep.
+    double last_loop_qpc = 0.0;
+    ULONGLONG last_loop_unbiased = 0;
     bool detaching = false;
     int64_t detach_sample = 0;
     double detach_deadline = 0.0;
@@ -1094,12 +1105,27 @@ struct AudioSource::Impl {
             pcm.resize(pcm.size() + static_cast<size_t>(gap) * channels, int16_t{0});
             return;
         }
-        // A long gap (a sleep, a device gone for minutes) is not materialized:
-        // the encoder reads anything before pcm_start as silence, so encode what
-        // is buffered and move the start past the gap.
+        // A long gap (a device reopen that blocked, a starved thread) is not
+        // materialized: the encoder reads anything before pcm_start as silence,
+        // so encode what is buffered and move the start past the gap.
         EncodeAvailable();
         pcm.clear();
         pcm_start = target;
+    }
+
+    /// The machine slept. The video pacer skips a sleep instead of filling it,
+    /// and the recorder re-attaches audio where video resumes, so the timeline
+    /// skips it too rather than encoding it as silence, which would push every
+    /// later sample of the track back by the length of the sleep.
+    void SkipSleep(int64_t target)
+    {
+        if (!have_cursor || target <= Cursor()) {
+            return;
+        }
+        EncodeAvailable();
+        pcm.clear();
+        pcm_start = target;
+        enc_pos = std::max(enc_pos, target);
     }
 
     void Place(int64_t at, const int16_t* data, int64_t frames, bool exact)
@@ -1428,6 +1454,22 @@ struct AudioSource::Impl {
             }
 
             const double now = QpcSeconds();
+            ULONGLONG unbiased = 0;
+            QueryUnbiasedInterruptTime(&unbiased);
+            // QPC counts through sleep and hibernate; the unbiased interrupt
+            // time does not. Their difference is exactly how long the machine
+            // was down, which no amount of thread starvation can fake.
+            if (last_loop_qpc > 0.0) {
+                const double slept = (now - last_loop_qpc)
+                                     - static_cast<double>(unbiased - last_loop_unbiased) / 1e7;
+                if (slept > kSleepSeconds) {
+                    log::Writef(L"audio: %s: the machine slept %.1f s, skipping it", Tag(), slept);
+                    SkipSleep(ToSample(now - SilenceLag()));
+                }
+            }
+            last_loop_qpc = now;
+            last_loop_unbiased = unbiased;
+
             TakeCommands(now);
 
             if (watcher && watcher->changed.exchange(false)) {
