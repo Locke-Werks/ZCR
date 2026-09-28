@@ -49,11 +49,13 @@ struct EncodedPacket {
                               // packet has been returned
 };
 
-/// NVENC HEVC Main10 on a D3D11 device, async mode.
+/// NVENC HEVC on a D3D11 device, async mode: Main10 4:2:0 from P010 textures,
+/// or Main 4:4:4 10 from R10G10B10A2 R'G'B' textures that NVENC converts with
+/// the VUI matrix (VideoFormat::SurfaceFormat).
 ///
 /// Loads nvEncodeAPI64.dll from System32 (it ships with the driver), opens a
-/// session on the caller's ID3D11Device, and encodes P010 textures the caller
-/// owns and registers once. Nothing is ever copied to system memory except the
+/// session on the caller's ID3D11Device, and encodes textures the caller owns
+/// and registers once. Nothing is ever copied to system memory except the
 /// finished bitstream.
 ///
 /// Fixed configuration: HEVC Main10 High tier, preset P5 up to 3840x2160@60;
@@ -81,8 +83,8 @@ public:
     /// this when it creates the device.
     bool Open(ID3D11Device* device, const EncoderSettings& settings, std::wstring& error);
 
-    /// Registers the caller's input ring: DXGI_FORMAT_P010 textures of exactly
-    /// format.width x format.height. Allocates one output bitstream buffer and
+    /// Registers the caller's input ring: format.SurfaceFormat() textures of
+    /// exactly format.width x format.height. Allocates one output bitstream buffer and
     /// one completion event per slot.
     bool RegisterInputs(ID3D11Texture2D* const* textures, size_t count, std::wstring& error);
 

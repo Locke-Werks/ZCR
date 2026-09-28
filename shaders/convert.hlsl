@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU General Public License along with
 // this program. If not, see <https://www.gnu.org/licenses/>.
 
-// Desktop surface -> P010, one pass per plane. See src/convert.h for the
+// Desktop surface -> P010, one pass per plane, or -> R10G10B10A2 in one pass
+// for 4:4:4. See src/convert.h for the
 // contract and src/convert.cpp for the constant buffer layout, which must match
 // ConvertConstants below byte for byte.
 //
@@ -216,6 +217,16 @@ float PSLuma(VSOut i) : SV_Target
 {
     const float3 rgb = NonLinearAt(int2(i.pos.xy));
     return CodeToP010(LumaCode(dot(LumaWeights(), rgb)));
+}
+
+// 4:4:4: the same R'G'B' the luma and chroma passes feed their matrix, written
+// to an R10G10B10A2_UNORM target that NVENC converts with the matrix and range
+// the VUI declares (src/nvenc.cpp). Quantized here rather than by the output
+// merger so every code is the nearest one by construction.
+float4 PSRgb(VSOut i) : SV_Target
+{
+    const float3 rgb = NonLinearAt(int2(i.pos.xy));
+    return float4(round(rgb * 1023.0) / 1023.0, 1.0);
 }
 
 // Half resolution. Each chroma sample is the box average of its 2x2 luma

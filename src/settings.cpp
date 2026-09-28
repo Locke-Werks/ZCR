@@ -141,6 +141,11 @@ bool Settings::IsSupportedFps(uint32_t fps)
     return fps == 30 || fps == 60 || fps == 120;
 }
 
+bool Settings::IsSupportedChroma(uint32_t chroma)
+{
+    return chroma == 420 || chroma == 444;
+}
+
 Settings Settings::Load(std::wstring& detail)
 {
     detail.clear();
@@ -185,6 +190,14 @@ Settings Settings::Load(std::wstring& detail)
     ReadString(object, L"output_dir", settings.output_dir, problems);
     ReadUint(object, L"cq", kMinCq, kMaxCq, settings.cq, problems);
     ReadUint(object, L"max_mbps", 0, kMaxMbps, settings.max_mbps, problems);
+    uint32_t chroma = settings.chroma;
+    if (ReadUint(object, L"chroma", 420, 444, chroma, problems)) {
+        if (IsSupportedChroma(chroma)) {
+            settings.chroma = chroma;
+        } else {
+            problems += L" \"chroma\" must be 444 or 420;";
+        }
+    }
     ReadBool(object, L"desktop_audio", settings.desktop_audio, problems);
     ReadBool(object, L"mic", settings.mic, problems);
     ReadString(object, L"mic_device", settings.mic_device, problems);
@@ -223,6 +236,7 @@ bool Settings::Save(std::wstring& error) const
     text += L"  \"output_dir\": " + json::Quote(output_dir) + L",\r\n";
     text += L"  \"cq\": " + std::to_wstring(cq) + L",\r\n";
     text += L"  \"max_mbps\": " + std::to_wstring(max_mbps) + L",\r\n";
+    text += L"  \"chroma\": " + std::to_wstring(chroma) + L",\r\n";
     text += L"  \"desktop_audio\": " + std::wstring(desktop_audio ? L"true" : L"false") + L",\r\n";
     text += L"  \"mic\": " + std::wstring(mic ? L"true" : L"false") + L",\r\n";
     text += L"  \"mic_device\": " + json::Quote(mic_device) + L"\r\n";
@@ -261,6 +275,7 @@ RecorderSettings Settings::ToRecorder() const
     out.output_dir = ResolvedOutputDir();
     out.cq = std::clamp(cq, kMinCq, kMaxCq);
     out.max_mbps = (std::min)(max_mbps, kMaxMbps);
+    out.chroma444 = chroma != 420;
     out.desktop_audio = desktop_audio;
     out.mic = mic;
     out.mic_device = mic_device;

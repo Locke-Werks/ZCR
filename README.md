@@ -19,8 +19,8 @@ nothing else: no overlay, no toasts, no capture border, no account. The icon is
 gray when idle, red while recording, and amber when something went wrong.
 
 Frames never leave the GPU. Desktop Duplication hands over the desktop as FP16
-scRGB, a pixel shader converts it to BT.2020 PQ 10-bit 4:2:0, and NVENC encodes
-straight from those textures. Only the finished bitstream touches system memory,
+scRGB, a pixel shader converts it to BT.2020 PQ 10-bit, and NVENC encodes
+straight from those textures, at full 4:4:4 chroma by default. Only the finished bitstream touches system memory,
 which is why recording costs a fraction of a percent of CPU.
 
 Audio is the exception, and it is off unless you turn it on. Desktop audio and
@@ -51,6 +51,7 @@ portable file.
 **Right click** for:
 
 - Framerate: 30, 60 or 120 fps
+- Chroma: 4:4:4 or 4:2:0
 - Monitor
 - Show cursor
 - Record desktop audio
@@ -59,7 +60,7 @@ portable file.
 - Open recordings folder
 - Exit
 
-Framerate, monitor and the audio choices are locked while a recording is
+Framerate, chroma, monitor and the audio choices are locked while a recording is
 running. Hover the icon
 for the elapsed time, or for the reason when it is amber.
 
@@ -67,7 +68,12 @@ Recordings go to `Videos\ZCR\ZCR_<date>_<time>.mp4`.
 
 ## What you get
 
-- HEVC Main 10, constant frame rate, 2 second GOP, no B-frames.
+- HEVC Main 4:4:4 10 by default: full-resolution color, so colored text and
+  thin colored lines keep clean edges. Chroma 4:2:0 gives HEVC Main 10
+  instead, which plays on more devices, including browsers, phones and TVs.
+  4:4:4 needs a player or editor that decodes HEVC 4:4:4, such as mpv, VLC or
+  DaVinci Resolve.
+- Constant frame rate, 2 second GOP, no B-frames.
 - In HDR mode: BT.2020 primaries, PQ transfer, and mastering display and content
   light level metadata from the display, in both the bitstream and the MP4.
   SDR content sits at the Windows SDR brightness setting, as it does on screen.
@@ -103,6 +109,7 @@ zcr --unregister-autostart
 
 options:
   --fps 30|60|120
+  --chroma 444|420
   --monitor N
   --desktop-audio on|off
   --mic on|off
@@ -129,6 +136,7 @@ output is captured: `zcr --status | Write-Output`.
 | `output_dir` | `Videos\ZCR` | `%VAR%` is expanded |
 | `cq` | `24` | constant quality, 1 to 51, lower is better |
 | `max_mbps` | `0` | bitrate cap; 0 scales with resolution and fps, about 100 at 4K60 |
+| `chroma` | `444` | 444 or 420 |
 | `desktop_audio` | `false` | record the default output device |
 | `mic` | `false` | record a microphone |
 | `mic_device` | default | microphone device id, set from the menu |

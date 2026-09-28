@@ -333,6 +333,7 @@ private:
     [[nodiscard]] std::wstring StatusReply() const;
 
     bool ChooseFps(uint32_t fps, std::wstring& message);
+    bool ChooseChroma(uint32_t chroma, std::wstring& message);
     bool ChooseMonitor(const MonitorInfo& monitor, std::wstring& message);
     bool ChooseAudio(bool& setting, bool on, const wchar_t* what, std::wstring& message);
     bool ChooseMicDevice(const AudioDevice* device, std::wstring& message);
@@ -488,6 +489,7 @@ void App::Refresh()
         const uint32_t fps = status.fps ? status.fps : settings_.fps;
         tip = L"ZCR: recording " + Clock(status.seconds) + L" (" + std::to_wstring(fps)
               + L" fps, " + (status.hdr ? L"HDR" : L"SDR")
+              + (status.chroma444 ? L" 4:4:4" : L" 4:2:0")
               + (status.desktop_audio ? L", desktop audio" : L"")
               + (status.mic ? L", mic" : L"") + L")";
     } else if (!local_error_.empty()) {
@@ -501,7 +503,8 @@ void App::Refresh()
             last_logged_error_ = status.error;
         }
     } else {
-        tip = L"ZCR: idle (" + std::to_wstring(settings_.fps) + L" fps, " + monitor_label_
+        tip = L"ZCR: idle (" + std::to_wstring(settings_.fps) + L" fps, "
+              + (settings_.chroma == 420 ? L"4:2:0, " : L"4:4:4, ") + monitor_label_
               + L")";
     }
 
@@ -526,9 +529,10 @@ bool App::StartRecording(std::wstring& path_or_error)
         return false;
     }
 
-    log::Writef(L"tray: start %u fps, cursor %s, monitor \"%s\", desktop audio %s, mic %s "
-                L"\"%s\", into %s",
-                recorder_settings.fps, recorder_settings.cursor ? L"on" : L"off",
+    log::Writef(L"tray: start %u fps, chroma %s, cursor %s, monitor \"%s\", desktop audio %s, "
+                L"mic %s \"%s\", into %s",
+                recorder_settings.fps, recorder_settings.chroma444 ? L"4:4:4" : L"4:2:0",
+                recorder_settings.cursor ? L"on" : L"off",
                 recorder_settings.monitor_device_path.c_str(),
                 recorder_settings.desktop_audio ? L"on" : L"off",
                 recorder_settings.mic ? L"on" : L"off", recorder_settings.mic_device.c_str(),
@@ -642,9 +646,11 @@ void App::ShowMenu(POINT anchor)
     HMENU fps_menu = CreatePopupMenu();
     HMENU monitor_menu = CreatePopupMenu();
     HMENU mic_menu = CreatePopupMenu();
-    if (!menu || !fps_menu || !monitor_menu || !mic_menu) {
+    HMENU chroma_menu = CreatePopupMenu();
+    if (!menu || !fps_menu || !monitor_menu || !mic_menu || !chroma_menu) {
         if (menu) DestroyMenu(menu);
         if (fps_menu) DestroyMenu(fps_menu);
+        if (chroma_menu) DestroyMenu(chroma_menu);
         if (monitor_menu) DestroyMenu(monitor_menu);
         if (mic_menu) DestroyMenu(mic_menu);
         return;
@@ -664,6 +670,12 @@ void App::ShowMenu(POINT anchor)
 
     const UINT locked = recording ? MF_GRAYED : 0u;
     AppendMenuW(menu, MF_POPUP | locked, reinterpret_cast<UINT_PTR>(fps_menu), L"Framerate");
+
+    AppendMenuW(chroma_menu, MF_STRING, kMenuChroma444, L"4:4:4 (sharp text)");
+    AppendMenuW(chroma_menu, MF_STRING, kMenuChroma420, L"4:2:0 (plays everywhere)");
+    CheckMenuRadioItem(chroma_menu, kMenuChroma444, kMenuChroma420,
+                       settings_.chroma == 420 ? kMenuChroma420 : kMenuChroma444, MF_BYCOMMAND);
+    AppendMenuW(menu, MF_POPUP | locked, reinterpret_cast<UINT_PTR>(chroma_menu), L"Chroma");
 
     const size_t shown = (std::min)(monitors.size(), static_cast<size_t>(kMenuMonitorMax));
     if (shown == 0) {
@@ -780,6 +792,12 @@ void App::ShowMenu(POINT anchor)
     case kMenuFps120:
         ChooseFps(120, message);
         break;
+    case kMenuChroma444:
+        ChooseChroma(444, message);
+        break;
+    case kMenuChroma420:
+        ChooseChroma(420, message);
+        break;
     case kMenuCursor:
         // Applies from the next recording; the current one keeps what it
         // started with.
@@ -833,6 +851,27 @@ bool App::ChooseFps(uint32_t fps, std::wstring& message)
     Persist();
     Refresh();
     message = L"fps " + std::to_wstring(fps);
+    return true;
+}
+
+bool App::ChooseChroma(uint32_t chroma, std::wstring& message)
+{
+    if (!Settings::IsSupportedChroma(chroma)) {
+        message = L"chroma must be 444 or 420";
+        return false;
+    }
+    if (chroma == settings_.chroma) {
+        message = L"chroma " + std::to_wstring(chroma);
+        return true;
+    }
+    if (IsRecording()) {
+        message = L"cannot change chroma while recording";
+        return false;
+    }
+    settings_.chroma = chroma;
+    Persist();
+    Refresh();
+    message = L"chroma " + std::to_wstring(chroma);
     return true;
 }
 
@@ -984,6 +1023,14 @@ void App::OnCommand(ipc::Request& request)
         } else {
             reply = (ChooseFps(fps, message) ? L"ok " : L"err ") + message;
         }
+    } else if (verb == L"set" && words.size() == 3 && ToLower(words[1]) == L"chroma") {
+        uint32_t chroma = 0;
+        std::wstring message;
+        if (!ParseUint(words[2], chroma)) {
+            reply = L"err chroma must be 444 or 420";
+        } else {
+            reply = (ChooseChroma(chroma, message) ? L"ok " : L"err ") + message;
+        }
     } else if (verb == L"set" && words.size() == 3 && ToLower(words[1]) == L"monitor") {
         uint32_t number = 0;
         const std::vector<MonitorInfo> monitors = EnumerateMonitors();
@@ -1069,9 +1116,9 @@ int App::Run(HINSTANCE instance)
     if (!detail.empty()) {
         log::Writef(L"settings: %s", detail.c_str());
     }
-    log::Writef(L"settings: %u fps, cursor %s, cq %u, max %u Mbps, desktop audio %s, "
+    log::Writef(L"settings: %u fps, chroma %u, cursor %s, cq %u, max %u Mbps, desktop audio %s, "
                 L"mic %s, output %s",
-                settings_.fps, settings_.cursor ? L"on" : L"off", settings_.cq,
+                settings_.fps, settings_.chroma, settings_.cursor ? L"on" : L"off", settings_.cq,
                 settings_.max_mbps, settings_.desktop_audio ? L"on" : L"off",
                 settings_.mic ? L"on" : L"off", settings_.ResolvedOutputDir().c_str());
 

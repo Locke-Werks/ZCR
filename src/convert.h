@@ -39,8 +39,8 @@ struct ConvertParams {
     bool draw_cursor = true;
 };
 
-/// Desktop surface -> P010 (4:2:0, 10 bits in the high bits of 16), all on the
-/// GPU, for NVENC to read in place.
+/// Desktop surface -> P010 (4:2:0, 10 bits in the high bits of 16) or
+/// R10G10B10A2 (4:4:4), all on the GPU, for NVENC to read in place.
 ///
 /// HDR: scRGB linear BT.709 -> BT.2020 linear -> nits (x80) -> PQ (ST 2084,
 ///      10000 nit reference) -> Y'CbCr BT.2020 non-constant luminance, 10-bit
@@ -50,8 +50,15 @@ struct ConvertParams {
 /// Two passes per frame into render target views on the target's two planes:
 /// PSLuma into plane 0 (R16_UNORM, full size), PSChroma into plane 1
 /// (R16G16_UNORM, half size in both directions, 2x2 box filter of the
-/// non-linear R'G'B' before the matrix). Shaders are shaders/convert.hlsl,
-/// compiled at build time; entry points VSMain, PSLuma, PSChroma.
+/// non-linear R'G'B' before the matrix).
+///
+/// 4:4:4 is one pass: PSRgb writes the same non-linear R'G'B', 10 bits per
+/// channel, and NVENC applies the matrix and range itself (see
+/// VideoFormat::SurfaceFormat). Nothing is subsampled, so colored text edges
+/// keep their chroma.
+///
+/// Shaders are shaders/convert.hlsl, compiled at build time; entry points
+/// VSMain, PSLuma, PSChroma, PSRgb.
 ///
 /// Single-threaded: every call from the capture thread.
 class Converter {
@@ -65,8 +72,8 @@ public:
     void Shutdown();
 
     /// Converts `source` (with the cursor from `cursor` when params.draw_cursor)
-    /// into `target`, a DXGI_FORMAT_P010 texture created with
-    /// D3D11_BIND_RENDER_TARGET. The target's size is the encoded size: the
+    /// into `target`, a DXGI_FORMAT_P010 or DXGI_FORMAT_R10G10B10A2_UNORM
+    /// texture created with D3D11_BIND_RENDER_TARGET; the format picks the path. The target's size is the encoded size: the
     /// rotated source size rounded down to even. RTVs are created per target
     /// on first use and cached, so a fixed ring costs nothing after warm-up.
     ///
@@ -88,6 +95,7 @@ private:
     struct TargetViews {
         Microsoft::WRL::ComPtr<ID3D11RenderTargetView> luma;
         Microsoft::WRL::ComPtr<ID3D11RenderTargetView> chroma;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rgb; // set instead of the two above
         UINT width = 0;
         UINT height = 0;
     };

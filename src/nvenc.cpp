@@ -273,7 +273,7 @@ bool NvencEncoder::Open(ID3D11Device* device, const EncoderSettings& settings, s
         return false;
     }
     if (format.width == 0 || format.height == 0 || (format.width & 1) || (format.height & 1)) {
-        error = L"NVENC: encode size must be non-zero and even for 4:2:0, got "
+        error = L"NVENC: encode size must be non-zero and even, got "
             + std::to_wstring(format.width) + L"x" + std::to_wstring(format.height);
         return false;
     }
@@ -370,6 +370,15 @@ bool NvencEncoder::Open(ID3D11Device* device, const EncoderSettings& settings, s
     if (cap == 0) {
         return fail(L"NVENC: this GPU does not encode 10-bit HEVC (Main10)");
     }
+    if (format.chroma444) {
+        if (!d.Cap(NV_ENC_CAPS_SUPPORT_YUV444_ENCODE, cap, error)) {
+            Close();
+            return false;
+        }
+        if (cap == 0) {
+            return fail(L"NVENC: this GPU does not encode 4:4:4 HEVC; switch chroma to 4:2:0");
+        }
+    }
     if (!d.Cap(NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT, cap, error)) {
         Close();
         return false;
@@ -411,7 +420,9 @@ bool NvencEncoder::Open(ID3D11Device* device, const EncoderSettings& settings, s
 
     NV_ENC_CONFIG config = preset.presetCfg;
     config.version = NV_ENC_CONFIG_VER;
-    config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN10_GUID;
+    // FREXT is Main 4:4:4 10 once chromaFormatIDC is 3 and the depth is 10.
+    config.profileGUID =
+        format.chroma444 ? NV_ENC_HEVC_PROFILE_FREXT_GUID : NV_ENC_HEVC_PROFILE_MAIN10_GUID;
     config.gopLength = d.gop;
     // No B-frames: output order equals input order, which is what lets Next
     // hand packets back strictly FIFO and the muxer skip composition offsets.
@@ -436,7 +447,7 @@ bool NvencEncoder::Open(ID3D11Device* device, const EncoderSettings& settings, s
     // Main tier would push the level to 6.x, which many decoders refuse.
     hevc.tier = NV_ENC_TIER_HEVC_HIGH;
     hevc.level = NV_ENC_LEVEL_AUTOSELECT;
-    hevc.chromaFormatIDC = 1;
+    hevc.chromaFormatIDC = format.chroma444 ? 3 : 1;
     hevc.inputBitDepth = NV_ENC_BIT_DEPTH_10;
     hevc.outputBitDepth = NV_ENC_BIT_DEPTH_10;
     hevc.idrPeriod = d.gop;
@@ -454,6 +465,10 @@ bool NvencEncoder::Open(ID3D11Device* device, const EncoderSettings& settings, s
     vui.colourPrimaries = static_cast<NV_ENC_VUI_COLOR_PRIMARIES>(format.ColourPrimaries());
     vui.transferCharacteristics =
         static_cast<NV_ENC_VUI_TRANSFER_CHARACTERISTIC>(format.TransferCharacteristics());
+    // With R'G'B' input (4:4:4) these two fields are also what NVENC converts
+    // with: measured on an RTX 4090, driver 616.56, flat 10-bit patches came out
+    // exactly on the BT.2020 limited-range codes with matrix 9 and on BT.709 with
+    // matrix 1. So the VUI cannot disagree with the pixels it describes.
     vui.colourMatrix = static_cast<NV_ENC_VUI_MATRIX_COEFFS>(format.MatrixCoefficients());
 
     if (format.hdr) {
@@ -545,9 +560,10 @@ bool NvencEncoder::RegisterInputs(ID3D11Texture2D* const* textures, size_t count
 
         D3D11_TEXTURE2D_DESC desc{};
         texture->GetDesc(&desc);
-        if (desc.Format != DXGI_FORMAT_P010 || desc.Width != format.width
+        if (desc.Format != format.SurfaceFormat() || desc.Width != format.width
             || desc.Height != format.height) {
-            error = L"NVENC: " + which + L" must be DXGI_FORMAT_P010 at "
+            error = L"NVENC: " + which + L" must be DXGI format "
+                + std::to_wstring(static_cast<int>(format.SurfaceFormat())) + L" at "
                 + std::to_wstring(format.width) + L"x" + std::to_wstring(format.height)
                 + L", got format " + std::to_wstring(static_cast<int>(desc.Format)) + L" at "
                 + std::to_wstring(desc.Width) + L"x" + std::to_wstring(desc.Height);
@@ -579,7 +595,9 @@ bool NvencEncoder::RegisterInputs(ID3D11Texture2D* const* textures, size_t count
         reg.pitch = 0; // DirectX resources carry their own pitch
         reg.subResourceIndex = 0;
         reg.resourceToRegister = texture;
-        reg.bufferFormat = NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
+        // ABGR10 is the word-ordered name for DXGI R10G10B10A2: red in the low bits.
+        reg.bufferFormat = format.chroma444 ? NV_ENC_BUFFER_FORMAT_ABGR10
+                                            : NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
         reg.bufferUsage = NV_ENC_INPUT_IMAGE;
         NVENCSTATUS status = d.api.nvEncRegisterResource(d.encoder, &reg);
         if (status != NV_ENC_SUCCESS) {

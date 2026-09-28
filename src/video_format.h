@@ -14,6 +14,8 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 #pragma once
 
+#include <dxgiformat.h>
+
 #include <cstdint>
 
 namespace zcr {
@@ -41,11 +43,13 @@ struct HdrMetadata {
 /// What a recording segment is. Fixed for the life of one file: a change in any
 /// field mid-recording closes the file and starts a new segment.
 struct VideoFormat {
-    uint32_t width = 0;   // encoded size, always even (4:2:0)
+    uint32_t width = 0;   // encoded size, always even
     uint32_t height = 0;
     uint32_t fps = 60;    // 30, 60 or 120; constant frame rate
     bool hdr = false;     // true: BT.2020 / SMPTE ST 2084 (PQ) / BT.2020nc
                           // false: BT.709 / BT.709 / BT.709
+    bool chroma444 = false; // true: HEVC Main 4:4:4 10, full-resolution chroma
+                            // false: HEVC Main 10, 4:2:0
     HdrMetadata hdr_meta; // meaningful only when hdr
 
     // ITU-T H.273 code points, as they go into the VUI and the colr box.
@@ -53,6 +57,15 @@ struct VideoFormat {
     [[nodiscard]] uint8_t TransferCharacteristics() const { return hdr ? 16 : 1; }
     [[nodiscard]] uint8_t MatrixCoefficients() const { return hdr ? 9 : 1; }
     [[nodiscard]] bool FullRange() const { return false; } // always limited (tv) range
+
+    /// What the converter renders and NVENC reads. 4:2:0 is Y'CbCr the shader
+    /// computes itself. 4:4:4 is R'G'B' that NVENC turns into Y'CbCr using the
+    /// VUI matrix and range above, because NVENC refuses planar 4:4:4 from a
+    /// D3D11 texture and DXGI has no planar 4:4:4 format to offer it anyway.
+    [[nodiscard]] DXGI_FORMAT SurfaceFormat() const
+    {
+        return chroma444 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_P010;
+    }
 };
 
 } // namespace zcr

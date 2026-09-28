@@ -55,6 +55,8 @@ inline constexpr UINT kMenuExit = 40007;
 inline constexpr UINT kMenuDesktopAudio = 40008;
 inline constexpr UINT kMenuMic = 40009;
 inline constexpr UINT kMenuMicDefault = 40010;
+inline constexpr UINT kMenuChroma444 = 40011;
+inline constexpr UINT kMenuChroma420 = 40012;
 
 /// Monitor N (0-based, EnumerateMonitors order) is kMenuMonitorFirst + N.
 inline constexpr UINT kMenuMonitorFirst = 41000;

@@ -76,6 +76,7 @@ void ShowUsage()
         L"                              Options change the saved settings, the same\r\n"
         L"                              as the tray menu does:\r\n"
         L"                                --fps 30|60|120\r\n"
+        L"                                --chroma 444|420\r\n"
         L"                                --monitor N\r\n"
         L"                                --desktop-audio on|off\r\n"
         L"                                --mic on|off\r\n"
@@ -111,7 +112,8 @@ void ShowUsage()
 
 struct Options {
     std::optional<uint32_t> fps;
-    std::optional<uint32_t> monitor;   // 1-based, as --list-monitors prints it
+    std::optional<uint32_t> chroma;
+    std::optional<uint32_t> monitor;  // 1-based, as --list-monitors prints it
     std::optional<bool> desktop_audio;
     std::optional<bool> mic;
     std::optional<std::wstring> mic_device;   // "default", or 1-based as --list-mics prints it
@@ -169,11 +171,12 @@ bool ParseOptions(const std::vector<std::wstring>& args, size_t first, Options& 
     for (size_t i = first; i < args.size(); ++i) {
         const std::wstring& arg = args[i];
         const bool is_fps = EqualsNoCase(arg, L"--fps");
+        const bool is_chroma = EqualsNoCase(arg, L"--chroma");
         const bool is_monitor = EqualsNoCase(arg, L"--monitor");
         const bool is_desktop_audio = EqualsNoCase(arg, L"--desktop-audio");
         const bool is_mic = EqualsNoCase(arg, L"--mic");
         const bool is_mic_device = EqualsNoCase(arg, L"--mic-device");
-        if (!is_fps && !is_monitor && !is_desktop_audio && !is_mic && !is_mic_device) {
+        if (!is_fps && !is_chroma && !is_monitor && !is_desktop_audio && !is_mic && !is_mic_device) {
             error = L"unexpected argument \"" + arg + L"\"; see zcr --help";
             return false;
         }
@@ -213,6 +216,12 @@ bool ParseOptions(const std::vector<std::wstring>& args, size_t first, Options& 
                 return false;
             }
             out.fps = value;
+        } else if (is_chroma) {
+            if (value != 444 && value != 420) {
+                error = L"--chroma must be 444 or 420";
+                return false;
+            }
+            out.chroma = value;
         } else {
             if (value == 0) {
                 error = L"--monitor counts from 1; see zcr --list-monitors";
@@ -330,6 +339,9 @@ int ApplyOptions(const Options& options)
     std::vector<std::wstring> requests;
     if (options.fps) {
         requests.push_back(L"set fps " + std::to_wstring(*options.fps));
+    }
+    if (options.chroma) {
+        requests.push_back(L"set chroma " + std::to_wstring(*options.chroma));
     }
     if (options.monitor) {
         requests.push_back(L"set monitor " + std::to_wstring(*options.monitor));

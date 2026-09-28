@@ -33,6 +33,7 @@ struct Settings {
     std::wstring output_dir;    // as written in the file; empty = the default
     uint32_t cq = 24;           // NVENC constant quality, 1..51
     uint32_t max_mbps = 0;      // 0 = derived from pixel rate
+    uint32_t chroma = 444;      // 444 or 420
     // Audio is opt-in. Off by default, so a recording is silent until asked.
     bool desktop_audio = false;
     bool mic = false;
@@ -55,6 +56,7 @@ struct Settings {
 
     [[nodiscard]] static std::wstring FilePath();
     [[nodiscard]] static bool IsSupportedFps(uint32_t fps);
+    [[nodiscard]] static bool IsSupportedChroma(uint32_t chroma);
 };
 
 } // namespace zcr

@@ -43,9 +43,10 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-/// Input ring depth. Each slot is one P010 frame in VRAM (12 MB at 4K). Eight
-/// gives NVENC's async queue room to absorb a slow frame without the pacer
-/// ever waiting at 120 fps, and costs under 100 MB of a 24 GB card.
+/// Input ring depth. Each slot is one frame in VRAM: 12 MB at 4K as P010, 32 MB
+/// as R10G10B10A2 for 4:4:4. Eight gives NVENC's async queue room to absorb a
+/// slow frame without the pacer ever waiting at 120 fps, and costs at most
+/// 256 MB of a 24 GB card.
 constexpr size_t kRingSize = 8;
 
 /// A sleep longer than this is skipped rather than caught up, since catching up
@@ -260,6 +261,7 @@ struct Recorder::Impl {
         f.height = EvenDown(swap ? capture.Width() : capture.Height());
         f.fps = settings.fps;
         f.hdr = capture.Hdr();
+        f.chroma444 = settings.chroma444;
         f.hdr_meta = monitor.hdr_meta;
         return f;
     }
@@ -274,7 +276,7 @@ struct Recorder::Impl {
         desc.Height = seg->format.height;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_P010;
+        desc.Format = seg->format.SurfaceFormat();
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -282,7 +284,9 @@ struct Recorder::Impl {
         for (auto& tex : seg->ring) {
             const HRESULT hr = device->CreateTexture2D(&desc, nullptr, &tex);
             if (FAILED(hr)) {
-                error = L"CreateTexture2D(P010 " + std::to_wstring(desc.Width) + L"x"
+                error = std::wstring(L"CreateTexture2D(")
+                        + (seg->format.chroma444 ? L"R10G10B10A2 " : L"P010 ")
+                        + std::to_wstring(desc.Width) + L"x"
                         + std::to_wstring(desc.Height) + L") failed: " + HrText(hr);
                 return false;
             }
@@ -321,9 +325,10 @@ struct Recorder::Impl {
             return false;
         }
 
-        log::Writef(L"recorder: segment %d %s  %ux%u@%u %s  %s  %zu audio track(s)", part,
+        log::Writef(L"recorder: segment %d %s  %ux%u@%u %s %s  %s  %zu audio track(s)", part,
                     seg->path.c_str(), seg->format.width, seg->format.height,
                     seg->format.fps, seg->format.hdr ? L"HDR" : L"SDR",
+                    seg->format.chroma444 ? L"4:4:4" : L"4:2:0",
                     monitor.friendly_name.c_str(), tracks.size());
 
         {
@@ -335,6 +340,7 @@ struct Recorder::Impl {
             status.width = seg->format.width;
             status.height = seg->format.height;
             status.hdr = seg->format.hdr;
+            status.chroma444 = seg->format.chroma444;
             status.monitor = monitor.friendly_name;
         }
 

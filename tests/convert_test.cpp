@@ -16,12 +16,13 @@
 // Standalone check of Converter against a double-precision CPU model of the
 // same color pipeline. Not part of the CMake build. Needs an NVIDIA GPU.
 //
-//   fxc the three entry points into <dir>\shaders\, then
+//   fxc the four entry points into <dir>\shaders\, then
 //   cl /std:c++20 /EHsc /Isrc /I<dir> tests\convert_test.cpp src\convert.cpp d3d11.lib dxgi.lib
 //
-// Every case converts a synthetic desktop on the GPU, reads the P010 result
-// back and compares every luma and chroma code with the CPU model, tolerance
-// one code. Exit code 0 only if every case passes.
+// Every case converts a synthetic desktop on the GPU twice: to P010, comparing
+// every luma and chroma code with the CPU model, and to R10G10B10A2 for 4:4:4,
+// comparing every R'G'B' code. Tolerance one code. Exit code 0 only if every
+// case passes.
 
 #include <d3d11_3.h>
 #include <dxgi1_6.h>
@@ -311,6 +312,19 @@ Planes Model(const Params& p, const Image& src)
     return out;
 }
 
+// 4:4:4: unrounded 10-bit R'G'B' codes, row-major at the output size.
+std::vector<Rgb> ModelRgb(const Params& p, const Image& src, int w, int h)
+{
+    std::vector<Rgb> out(static_cast<size_t>(w) * h);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const Rgb v = NonLinear(p, src, x, y);
+            out[static_cast<size_t>(y) * w + x] = {v.r * 1023.0, v.g * 1023.0, v.b * 1023.0};
+        }
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Test content
 // ---------------------------------------------------------------------------
@@ -568,14 +582,14 @@ ComPtr<ID3D11ShaderResourceView> MakeTexture(Gpu& gpu, DXGI_FORMAT format, int w
     return srv;
 }
 
-ComPtr<ID3D11Texture2D> MakeP010(Gpu& gpu, int w, int h, bool staging)
+ComPtr<ID3D11Texture2D> MakeTarget(Gpu& gpu, DXGI_FORMAT format, int w, int h, bool staging)
 {
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = static_cast<UINT>(w);
     desc.Height = static_cast<UINT>(h);
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_P010;
+    desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Usage = staging ? D3D11_USAGE_STAGING : D3D11_USAGE_DEFAULT;
     desc.BindFlags = staging ? 0u : static_cast<UINT>(D3D11_BIND_RENDER_TARGET);
@@ -585,6 +599,11 @@ ComPtr<ID3D11Texture2D> MakeP010(Gpu& gpu, int w, int h, bool staging)
         return nullptr;
     }
     return tex;
+}
+
+ComPtr<ID3D11Texture2D> MakeP010(Gpu& gpu, int w, int h, bool staging)
+{
+    return MakeTarget(gpu, DXGI_FORMAT_P010, w, h, staging);
 }
 
 void ProbeRtvMethods(Gpu& gpu)
@@ -659,6 +678,29 @@ bool ReadP010(Gpu& gpu, ID3D11Texture2D* target, int w, int h, Readback& out)
     return true;
 }
 
+// R10G10B10A2 words, red in the low bits.
+bool ReadRgb10(Gpu& gpu, ID3D11Texture2D* target, int w, int h, std::vector<uint32_t>& out)
+{
+    ComPtr<ID3D11Texture2D> staging =
+        MakeTarget(gpu, DXGI_FORMAT_R10G10B10A2_UNORM, w, h, true);
+    if (!staging) {
+        return false;
+    }
+    gpu.context->CopyResource(staging.Get(), target);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(gpu.context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+        return false;
+    }
+    out.resize(static_cast<size_t>(w) * h);
+    const auto* base = static_cast<const uint8_t*>(m.pData);
+    for (int y = 0; y < h; ++y) {
+        const auto* row = reinterpret_cast<const uint32_t*>(base + static_cast<size_t>(y) * m.RowPitch);
+        std::copy(row, row + w, &out[static_cast<size_t>(y) * w]);
+    }
+    gpu.context->Unmap(staging.Get(), 0);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Cases
 // ---------------------------------------------------------------------------
@@ -712,7 +754,7 @@ void PrintSpotTable(const Case& c, const Planes& model, const Readback& gpu)
     }
 }
 
-bool RunCase(Gpu& gpu, zcr::Converter& converter, const Case& c, uint32_t seed)
+bool RunCase(Gpu& gpu, zcr::Converter& converter, const Case& c, uint32_t seed, bool rgb)
 {
     std::vector<uint8_t> bytes;
     const Image src = MakeSource(c.hdr, c.w, c.h, seed, bytes);
@@ -743,7 +785,9 @@ bool RunCase(Gpu& gpu, zcr::Converter& converter, const Case& c, uint32_t seed)
     p.shape = &shape;
     const Planes model = Model(p, src);
 
-    ComPtr<ID3D11Texture2D> target = MakeP010(gpu, model.w, model.h, false);
+    ComPtr<ID3D11Texture2D> target =
+        MakeTarget(gpu, rgb ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_P010, model.w, model.h,
+                   false);
     if (!src_srv || !target) {
         std::printf("FAIL  %s: cannot create textures\n", c.name);
         return false;
@@ -759,6 +803,45 @@ bool RunCase(Gpu& gpu, zcr::Converter& converter, const Case& c, uint32_t seed)
                            target.Get(), params, error)) {
         std::printf("FAIL  %s: Convert: %ls\n", c.name, error.c_str());
         return false;
+    }
+
+    char title[160];
+    std::snprintf(title, sizeof(title), "%s  [%s %s %dx%d rot %s -> %dx%d, white %.0f]", c.name,
+                  c.hdr ? "HDR" : "SDR", rgb ? "4:4:4" : "4:2:0", c.w, c.h,
+                  RotationName(c.rotation), model.w, model.h,
+                  static_cast<double>(c.sdr_white_nits));
+
+    if (rgb) {
+        std::vector<uint32_t> words;
+        if (!ReadRgb10(gpu, target.Get(), model.w, model.h, words)) {
+            std::printf("FAIL  %s: readback\n", c.name);
+            return false;
+        }
+        const std::vector<Rgb> expect = ModelRgb(p, src, model.w, model.h);
+        double worst = 0;
+        long bad = 0, alpha = 0;
+        for (size_t i = 0; i < words.size(); ++i) {
+            const uint32_t w = words[i];
+            const double got[3] = {static_cast<double>(w & 0x3FF),
+                                   static_cast<double>((w >> 10) & 0x3FF),
+                                   static_cast<double>((w >> 20) & 0x3FF)};
+            const double want[3] = {expect[i].r, expect[i].g, expect[i].b};
+            for (int ch = 0; ch < 3; ++ch) {
+                const double d = std::abs(got[ch] - want[ch]);
+                worst = std::max(worst, d);
+                if (d > 1.0) {
+                    ++bad;
+                }
+            }
+            if ((w >> 30) != 3) {
+                ++alpha;
+            }
+        }
+        const int debug = DrainDebugMessages(gpu);
+        const bool ok = bad == 0 && alpha == 0 && debug == 0;
+        std::printf("%s  %-78s max|dRGB| %.2f  >1: %ld  alpha!=3: %ld\n", ok ? "pass" : "FAIL",
+                    title, worst, bad, alpha);
+        return ok;
     }
 
     Readback rb;
@@ -789,10 +872,6 @@ bool RunCase(Gpu& gpu, zcr::Converter& converter, const Case& c, uint32_t seed)
     const int debug = DrainDebugMessages(gpu);
     const bool ok = bad == 0 && low_bits == 0 && debug == 0;
 
-    char title[160];
-    std::snprintf(title, sizeof(title), "%s  [%s %dx%d rot %s -> %dx%d, white %.0f]", c.name,
-                  c.hdr ? "HDR" : "SDR", c.w, c.h, RotationName(c.rotation), model.w, model.h,
-                  static_cast<double>(c.sdr_white_nits));
     std::printf("%s  %-78s max|dY| %.2f  max|dC| %.2f  >1: %ld  low6!=0: %ld\n", ok ? "pass" : "FAIL",
                 title, max_y, max_c, bad, low_bits);
     if (c.spot_table) {
@@ -869,18 +948,21 @@ int main()
     };
 
     int failed = matrix_err < 1e-9 ? 0 : 1;
-    uint32_t seed = 12345;
-    for (const Case& c : cases) {
-        if (!RunCase(gpu, converter, c, seed++)) {
-            ++failed;
+    for (const bool rgb : {false, true}) {
+        uint32_t seed = 12345;
+        for (const Case& c : cases) {
+            if (!RunCase(gpu, converter, c, seed++, rgb)) {
+                ++failed;
+            }
+            // Each case uses a fresh target; drop the cached views so the test
+            // also exercises view creation every time.
+            converter.ForgetTargets();
         }
-        // Each case uses a fresh target; drop the cached views so the test
-        // also exercises view creation every time.
-        converter.ForgetTargets();
+        std::printf("\n");
     }
     converter.Shutdown();
 
-    std::printf("\n%s: %d of %zu checks failed\n", failed ? "FAIL" : "PASS", failed,
-                std::size(cases) + 1);
+    std::printf("%s: %d of %zu checks failed\n", failed ? "FAIL" : "PASS", failed,
+                std::size(cases) * 2 + 1);
     return failed ? 1 : 0;
 }

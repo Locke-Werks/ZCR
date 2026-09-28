@@ -49,6 +49,7 @@ set(ZCR_SHADERS
     "convert_vs|VSMain|vs_5_0"
     "convert_ps_luma|PSLuma|ps_5_0"
     "convert_ps_chroma|PSChroma|ps_5_0"
+    "convert_ps_rgb|PSRgb|ps_5_0"
 )
 set(ZCR_SHADER_HEADERS "")
 foreach(_spec IN LISTS ZCR_SHADERS)

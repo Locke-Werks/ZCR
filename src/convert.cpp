@@ -24,6 +24,7 @@
 
 #include "shaders/convert_ps_chroma.h"
 #include "shaders/convert_ps_luma.h"
+#include "shaders/convert_ps_rgb.h"
 #include "shaders/convert_vs.h"
 
 namespace zcr {
@@ -113,6 +114,7 @@ struct Converter::Pipeline {
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> luma;
     ComPtr<ID3D11PixelShader> chroma;
+    ComPtr<ID3D11PixelShader> rgb;
     ComPtr<ID3D11Buffer> constants;
     ComPtr<ID3D11RasterizerState> raster;
 };
@@ -142,6 +144,11 @@ bool Converter::Init(ID3D11Device* device, std::wstring& error)
     hr = device->CreatePixelShader(g_PSChroma, sizeof(g_PSChroma), nullptr, &p->chroma);
     if (FAILED(hr)) {
         error = HrText(L"CreatePixelShader(PSChroma)", hr);
+        return false;
+    }
+    hr = device->CreatePixelShader(g_PSRgb, sizeof(g_PSRgb), nullptr, &p->rgb);
+    if (FAILED(hr)) {
+        error = HrText(L"CreatePixelShader(PSRgb)", hr);
         return false;
     }
 
@@ -217,22 +224,33 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, UINT source_width, UIN
     if (it == targets_.end()) {
         D3D11_TEXTURE2D_DESC desc{};
         target->GetDesc(&desc);
-        if (desc.Format != DXGI_FORMAT_P010 || !(desc.BindFlags & D3D11_BIND_RENDER_TARGET)) {
-            error = L"Converter::Convert: target is not a P010 render target";
+        const bool rgb = desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
+        if ((desc.Format != DXGI_FORMAT_P010 && !rgb)
+            || !(desc.BindFlags & D3D11_BIND_RENDER_TARGET)) {
+            error = L"Converter::Convert: target is not a P010 or R10G10B10A2 render target";
             return false;
         }
         TargetViews views;
         views.width = desc.Width;
         views.height = desc.Height;
-        HRESULT hr = CreatePlaneView(device_.Get(), target, DXGI_FORMAT_R16_UNORM, 0, views.luma);
-        if (FAILED(hr)) {
-            error = HrText(L"CreateRenderTargetView(P010 luma, R16_UNORM)", hr);
-            return false;
-        }
-        hr = CreatePlaneView(device_.Get(), target, DXGI_FORMAT_R16G16_UNORM, 1, views.chroma);
-        if (FAILED(hr)) {
-            error = HrText(L"CreateRenderTargetView(P010 chroma, R16G16_UNORM)", hr);
-            return false;
+        if (rgb) {
+            const HRESULT hr = device_->CreateRenderTargetView(target, nullptr, &views.rgb);
+            if (FAILED(hr)) {
+                error = HrText(L"CreateRenderTargetView(R10G10B10A2_UNORM)", hr);
+                return false;
+            }
+        } else {
+            HRESULT hr =
+                CreatePlaneView(device_.Get(), target, DXGI_FORMAT_R16_UNORM, 0, views.luma);
+            if (FAILED(hr)) {
+                error = HrText(L"CreateRenderTargetView(P010 luma, R16_UNORM)", hr);
+                return false;
+            }
+            hr = CreatePlaneView(device_.Get(), target, DXGI_FORMAT_R16G16_UNORM, 1, views.chroma);
+            if (FAILED(hr)) {
+                error = HrText(L"CreateRenderTargetView(P010 chroma, R16G16_UNORM)", hr);
+                return false;
+            }
         }
         it = targets_.emplace(target, std::move(views)).first;
     }
@@ -293,21 +311,29 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, UINT source_width, UIN
     vp.Width = static_cast<float>(out_width);
     vp.Height = static_cast<float>(out_height);
     vp.MaxDepth = 1.0f;
-    ID3D11RenderTargetView* luma = views.luma.Get();
-    ctx->OMSetRenderTargets(1, &luma, nullptr);
-    ctx->RSSetViewports(1, &vp);
-    ctx->PSSetShader(p->luma.Get(), nullptr, 0);
-    ctx->Draw(3, 0);
+    if (views.rgb) {
+        ID3D11RenderTargetView* rgb = views.rgb.Get();
+        ctx->OMSetRenderTargets(1, &rgb, nullptr);
+        ctx->RSSetViewports(1, &vp);
+        ctx->PSSetShader(p->rgb.Get(), nullptr, 0);
+        ctx->Draw(3, 0);
+    } else {
+        ID3D11RenderTargetView* luma = views.luma.Get();
+        ctx->OMSetRenderTargets(1, &luma, nullptr);
+        ctx->RSSetViewports(1, &vp);
+        ctx->PSSetShader(p->luma.Get(), nullptr, 0);
+        ctx->Draw(3, 0);
 
-    vp.Width = static_cast<float>(out_width / 2);
-    vp.Height = static_cast<float>(out_height / 2);
-    ID3D11RenderTargetView* chroma = views.chroma.Get();
-    ctx->OMSetRenderTargets(1, &chroma, nullptr);
-    ctx->RSSetViewports(1, &vp);
-    ctx->PSSetShader(p->chroma.Get(), nullptr, 0);
-    ctx->Draw(3, 0);
+        vp.Width = static_cast<float>(out_width / 2);
+        vp.Height = static_cast<float>(out_height / 2);
+        ID3D11RenderTargetView* chroma = views.chroma.Get();
+        ctx->OMSetRenderTargets(1, &chroma, nullptr);
+        ctx->RSSetViewports(1, &vp);
+        ctx->PSSetShader(p->chroma.Get(), nullptr, 0);
+        ctx->Draw(3, 0);
+    }
 
-    // NVENC maps the P010 texture next; leaving it bound as a render target
+    // NVENC maps the target next; leaving it bound as a render target
     // (or the desktop surface bound as an input while capture copies into it)
     // is a hazard the runtime would have to resolve behind our back.
     ID3D11ShaderResourceView* no_srvs[2] = {};

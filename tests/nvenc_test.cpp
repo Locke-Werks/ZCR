@@ -22,8 +22,8 @@
 //      /Fe:tests\out\nvenc_test.exe /link d3d11.lib dxgi.lib
 //
 // Run from the repo root:
-//   nvenc_test [--sdr] [--fps N] [--frames N] [--size WxH] [--cq N] [--out path]
-// Defaults: HDR, 3840x2160, 120 fps, 600 frames, tests\out\nvenc_test.hevc
+//   nvenc_test [--sdr] [--420] [--fps N] [--frames N] [--size WxH] [--cq N] [--out path]
+// Defaults: HDR, 4:4:4, 3840x2160, 120 fps, 600 frames, tests\out\nvenc_test.hevc
 // (tests\out\nvenc_test_sdr.hevc with --sdr).
 
 #include "nvenc.h"
@@ -73,6 +73,7 @@ private:
 
 struct Options {
     bool hdr = true;
+    bool chroma444 = true;
     uint32_t width = 3840;
     uint32_t height = 2160;
     uint32_t fps = 120;
@@ -90,6 +91,8 @@ constexpr size_t kSlots = 6;
         const bool has_value = i + 1 < argc;
         if (arg == L"--sdr") {
             o.hdr = false;
+        } else if (arg == L"--420") {
+            o.chroma444 = false;
         } else if (arg == L"--fps" && has_value) {
             o.fps = static_cast<uint32_t>(std::wcstoul(argv[++i], nullptr, 10));
         } else if (arg == L"--frames" && has_value) {
@@ -204,6 +207,32 @@ constexpr size_t kSlots = 6;
     return buffer;
 }
 
+// R10G10B10A2, red in the low bits: the same ramp, bar and grain as BuildFrame,
+// with per-channel detail at full resolution so 4:4:4 has chroma to spend on.
+[[nodiscard]] std::vector<uint32_t> BuildFrameRgb(uint32_t w, uint32_t h, uint32_t phase)
+{
+    std::vector<uint32_t> buffer(static_cast<size_t>(w) * h);
+    const uint32_t bar = (phase * 97) % w;
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            uint32_t v = (x + y + phase * 24) % 1024;
+            if (x >= bar && x < bar + 64) {
+                v = 1000;
+            }
+            const uint32_t noise = Hash(x * 7919u + y * 104729u + phase);
+            const auto channel = [&](uint32_t base, int shift) {
+                const int grain = static_cast<int>((noise >> shift) & 15) - 8;
+                return static_cast<uint32_t>(std::clamp(static_cast<int>(base) + grain, 0, 1023));
+            };
+            const uint32_t r = channel(v, 0);
+            const uint32_t g = channel((x * 2 + phase * 30) % 1024, 4);
+            const uint32_t b = channel((y * 2 + phase * 30) % 1024, 8);
+            buffer[static_cast<size_t>(y) * w + x] = r | (g << 10) | (b << 20) | (3u << 30);
+        }
+    }
+    return buffer;
+}
+
 [[nodiscard]] const wchar_t* NalName(uint8_t type)
 {
     switch (type) {
@@ -250,44 +279,49 @@ int wmain(int argc, wchar_t** argv)
     // render targets, so the test uses the same bind flags.
     std::vector<Com<ID3D11Texture2D>> ring(kSlots);
     std::vector<ID3D11Texture2D*> raw(kSlots);
+    zcr::EncoderSettings settings;
+    settings.format.width = options.width;
+    settings.format.height = options.height;
+    settings.format.fps = options.fps;
+    settings.format.hdr = options.hdr;
+    settings.format.chroma444 = options.chroma444;
+    settings.cq = options.cq;
+
     for (size_t i = 0; i < kSlots; ++i) {
-        const std::vector<uint16_t> pixels =
-            BuildFrame(options.width, options.height, static_cast<uint32_t>(i));
+        const auto phase = static_cast<uint32_t>(i);
+        const std::vector<uint16_t> yuv =
+            options.chroma444 ? std::vector<uint16_t>{} : BuildFrame(options.width, options.height, phase);
+        const std::vector<uint32_t> rgb =
+            options.chroma444 ? BuildFrameRgb(options.width, options.height, phase) : std::vector<uint32_t>{};
 
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = options.width;
         desc.Height = options.height;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_P010;
+        desc.Format = settings.format.SurfaceFormat();
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET;
 
         D3D11_SUBRESOURCE_DATA init{};
-        init.pSysMem = pixels.data();
-        init.SysMemPitch = options.width * 2;
+        init.pSysMem = options.chroma444 ? static_cast<const void*>(rgb.data()) : yuv.data();
+        init.SysMemPitch = options.width * (options.chroma444 ? 4 : 2);
         const HRESULT hr = device->CreateTexture2D(&desc, &init, ring[i].Receive());
         if (FAILED(hr)) {
-            std::fwprintf(stderr, L"CreateTexture2D(P010) failed: 0x%08lX\n",
-                          static_cast<unsigned long>(hr));
+            std::fwprintf(stderr, L"CreateTexture2D(format %d) failed: 0x%08lX\n",
+                          static_cast<int>(desc.Format), static_cast<unsigned long>(hr));
             return 1;
         }
         raw[i] = ring[i].Get();
     }
     context->Flush();
 
-    zcr::EncoderSettings settings;
-    settings.format.width = options.width;
-    settings.format.height = options.height;
-    settings.format.fps = options.fps;
-    settings.format.hdr = options.hdr;
-    settings.cq = options.cq;
-
     const uint64_t pixel_rate =
         static_cast<uint64_t>(options.width) * options.height * options.fps;
-    std::wprintf(L"config: %ux%u@%u %ls, preset %ls, %u frames\n", options.width, options.height,
-                 options.fps, options.hdr ? L"HDR" : L"SDR",
+    std::wprintf(L"config: %ux%u@%u %ls %ls, preset %ls, %u frames\n", options.width,
+                 options.height, options.fps, options.hdr ? L"HDR" : L"SDR",
+                 options.chroma444 ? L"4:4:4" : L"4:2:0",
                  pixel_rate > 3840ull * 2160ull * 60ull ? L"P4" : L"P5", options.frames);
 
     zcr::NvencEncoder encoder;
