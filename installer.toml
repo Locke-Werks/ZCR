@@ -9,7 +9,7 @@
 
 [product]
 name         = "ZCR"
-version      = "0.2.1"
+version      = "0.2.2"
 publisher    = "Locke Werks"
 description  = "Zero-copy HDR screen recorder for NVIDIA"
 copyright    = "Copyright (C) 2026 Locke Werks"
