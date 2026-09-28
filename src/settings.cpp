@@ -185,6 +185,9 @@ Settings Settings::Load(std::wstring& detail)
     ReadString(object, L"output_dir", settings.output_dir, problems);
     ReadUint(object, L"cq", kMinCq, kMaxCq, settings.cq, problems);
     ReadUint(object, L"max_mbps", 0, kMaxMbps, settings.max_mbps, problems);
+    ReadBool(object, L"desktop_audio", settings.desktop_audio, problems);
+    ReadBool(object, L"mic", settings.mic, problems);
+    ReadString(object, L"mic_device", settings.mic_device, problems);
 
     if (!problems.empty()) {
         problems.pop_back();   // the trailing ';'
@@ -219,7 +222,10 @@ bool Settings::Save(std::wstring& error) const
     text += L"  \"cursor\": " + std::wstring(cursor ? L"true" : L"false") + L",\r\n";
     text += L"  \"output_dir\": " + json::Quote(output_dir) + L",\r\n";
     text += L"  \"cq\": " + std::to_wstring(cq) + L",\r\n";
-    text += L"  \"max_mbps\": " + std::to_wstring(max_mbps) + L"\r\n";
+    text += L"  \"max_mbps\": " + std::to_wstring(max_mbps) + L",\r\n";
+    text += L"  \"desktop_audio\": " + std::wstring(desktop_audio ? L"true" : L"false") + L",\r\n";
+    text += L"  \"mic\": " + std::wstring(mic ? L"true" : L"false") + L",\r\n";
+    text += L"  \"mic_device\": " + json::Quote(mic_device) + L"\r\n";
     text += L"}\r\n";
 
     if (!WriteTextFile(path, text)) {
@@ -255,6 +261,9 @@ RecorderSettings Settings::ToRecorder() const
     out.output_dir = ResolvedOutputDir();
     out.cq = std::clamp(cq, kMinCq, kMaxCq);
     out.max_mbps = (std::min)(max_mbps, kMaxMbps);
+    out.desktop_audio = desktop_audio;
+    out.mic = mic;
+    out.mic_device = mic_device;
     return out;
 }
 

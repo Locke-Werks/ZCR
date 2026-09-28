@@ -23,6 +23,10 @@ scRGB, a pixel shader converts it to BT.2020 PQ 10-bit 4:2:0, and NVENC encodes
 straight from those textures. Only the finished bitstream touches system memory,
 which is why recording costs a fraction of a percent of CPU.
 
+Audio is the exception, and it is off unless you turn it on. Desktop audio and
+the microphone are captured with WASAPI and encoded to AAC on the CPU, each
+into its own track.
+
 ## Requirements
 
 - Windows 11
@@ -49,10 +53,14 @@ portable file.
 - Framerate: 30, 60 or 120 fps
 - Monitor
 - Show cursor
+- Record desktop audio
+- Record microphone
+- Microphone: the default, or a specific device
 - Open recordings folder
 - Exit
 
-Framerate and monitor are locked while a recording is running. Hover the icon
+Framerate, monitor and the audio choices are locked while a recording is
+running. Hover the icon
 for the elapsed time, or for the reason when it is amber.
 
 Recordings go to `Videos\ZCR\ZCR_<date>_<time>.mp4`.
@@ -68,26 +76,41 @@ Recordings go to `Videos\ZCR\ZCR_<date>_<time>.mp4`.
   the last completed 2 second fragment is still playable.
 - If the resolution or HDR state changes mid-recording, the file is closed and
   recording continues in `..._part2.mp4`.
+- If the machine goes to sleep, the recording is finalized first.
 - Above 4K60, each frame is split across both NVENC engines so 4K120 keeps up.
+- With audio on: desktop audio as a 48 kHz stereo AAC track at 192 kbps, the
+  microphone as a separate 48 kHz mono AAC track at 96 kbps, both aligned to the
+  video from its first frame. Players play the first audio track; editors see
+  both. Desktop audio follows the default output device if it changes
+  mid-recording, and an unplugged microphone leaves silence rather than
+  stopping the recording.
 
 ## Command line
 
 The same `zcr.exe` drives the running tray instance over a named pipe:
 
 ```
-zcr --start [--fps N] [--monitor N]   start recording, print the output path
+zcr --start [options]                 start recording, print the output path
 zcr --stop                            stop, print the finished path
 zcr --toggle                          print "started <path>" or "stopped <path>"
 zcr --status                          idle | recording ... | error <message>
-zcr --record-for SECONDS [--fps N] [--monitor N]
+zcr --record-for SECONDS [options]
 zcr --list-monitors                   N for --monitor is the first column
+zcr --list-mics                       N for --mic-device is the first column
 zcr --quit                            stop any recording and exit the tray
 zcr --register-autostart              start at sign-in (HKCU Run key)
 zcr --unregister-autostart
+
+options:
+  --fps 30|60|120
+  --monitor N
+  --desktop-audio on|off
+  --mic on|off
+  --mic-device default|N
 ```
 
 `--start`, `--toggle` and `--record-for` launch the tray if it is not running.
-`--fps` and `--monitor` change the saved settings, the same as the menu.
+The options change the saved settings, the same as the menu.
 
 Exit codes: 0 ok, 1 error (message on stderr), 2 not running.
 
@@ -106,6 +129,9 @@ output is captured: `zcr --status | Write-Output`.
 | `output_dir` | `Videos\ZCR` | `%VAR%` is expanded |
 | `cq` | `24` | constant quality, 1 to 51, lower is better |
 | `max_mbps` | `0` | bitrate cap; 0 scales with resolution and fps, about 100 at 4K60 |
+| `desktop_audio` | `false` | record the default output device |
+| `mic` | `false` | record a microphone |
+| `mic_device` | default | microphone device id, set from the menu |
 
 The log is `%LOCALAPPDATA%\ZCR\zcr.log`.
 

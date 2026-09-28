@@ -33,6 +33,10 @@ struct Settings {
     std::wstring output_dir;    // as written in the file; empty = the default
     uint32_t cq = 24;           // NVENC constant quality, 1..51
     uint32_t max_mbps = 0;      // 0 = derived from pixel rate
+    // Audio is opt-in. Off by default, so a recording is silent until asked.
+    bool desktop_audio = false;
+    bool mic = false;
+    std::wstring mic_device;    // AudioDevice::id; empty = the default microphone
 
     /// Missing file: defaults, `detail` empty. Unreadable or unparseable file:
     /// defaults, and `detail` says why so the caller can log it. The file is

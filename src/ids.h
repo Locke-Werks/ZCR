@@ -52,9 +52,16 @@ inline constexpr UINT kMenuFps120 = 40004;
 inline constexpr UINT kMenuCursor = 40005;
 inline constexpr UINT kMenuOpenFolder = 40006;
 inline constexpr UINT kMenuExit = 40007;
+inline constexpr UINT kMenuDesktopAudio = 40008;
+inline constexpr UINT kMenuMic = 40009;
+inline constexpr UINT kMenuMicDefault = 40010;
 
 /// Monitor N (0-based, EnumerateMonitors order) is kMenuMonitorFirst + N.
 inline constexpr UINT kMenuMonitorFirst = 41000;
 inline constexpr UINT kMenuMonitorMax = 64;
+
+/// Microphone N (0-based, EnumerateMicrophones order) is kMenuMicFirst + N.
+inline constexpr UINT kMenuMicFirst = 42000;
+inline constexpr UINT kMenuMicMax = 64;
 
 } // namespace zcr

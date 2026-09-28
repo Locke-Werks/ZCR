@@ -14,6 +14,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 #include "tray.h"
 
+#include "audio.h"
 #include "diag_log.h"
 #include "ids.h"
 #include "ipc.h"
@@ -333,6 +334,8 @@ private:
 
     bool ChooseFps(uint32_t fps, std::wstring& message);
     bool ChooseMonitor(const MonitorInfo& monitor, std::wstring& message);
+    bool ChooseAudio(bool& setting, bool on, const wchar_t* what, std::wstring& message);
+    bool ChooseMicDevice(const AudioDevice* device, std::wstring& message);
     void Persist();
     void OpenRecordingsFolder();
     void Close();
@@ -413,6 +416,17 @@ LRESULT App::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam)
         }
         return 0;
 
+    case WM_POWERBROADCAST:
+        // A recording across a sleep is hours of frozen picture and silence
+        // that the pacer and the audio timeline would each have to paper over,
+        // and never agree about. Finish the file before the machine goes down.
+        if (wparam == PBT_APMSUSPEND && IsRecording()) {
+            log::Write(L"tray: system suspending, finalizing the recording");
+            std::wstring result;
+            StopRecording(result);
+        }
+        return TRUE;
+
     case WM_QUERYENDSESSION:
         return TRUE;
 
@@ -473,7 +487,9 @@ void App::Refresh()
         state = IconState::Recording;
         const uint32_t fps = status.fps ? status.fps : settings_.fps;
         tip = L"ZCR: recording " + Clock(status.seconds) + L" (" + std::to_wstring(fps)
-              + L" fps, " + (status.hdr ? L"HDR" : L"SDR") + L")";
+              + L" fps, " + (status.hdr ? L"HDR" : L"SDR")
+              + (status.desktop_audio ? L", desktop audio" : L"")
+              + (status.mic ? L", mic" : L"") + L")";
     } else if (!local_error_.empty()) {
         state = IconState::Error;
         tip = L"ZCR: " + local_error_;
@@ -510,9 +526,12 @@ bool App::StartRecording(std::wstring& path_or_error)
         return false;
     }
 
-    log::Writef(L"tray: start %u fps, cursor %s, monitor \"%s\", into %s",
+    log::Writef(L"tray: start %u fps, cursor %s, monitor \"%s\", desktop audio %s, mic %s "
+                L"\"%s\", into %s",
                 recorder_settings.fps, recorder_settings.cursor ? L"on" : L"off",
                 recorder_settings.monitor_device_path.c_str(),
+                recorder_settings.desktop_audio ? L"on" : L"off",
+                recorder_settings.mic ? L"on" : L"off", recorder_settings.mic_device.c_str(),
                 recorder_settings.output_dir.c_str());
 
     const bool ok = recorder_->Start(recorder_settings, path_or_error);
@@ -616,14 +635,18 @@ void App::ShowMenu(POINT anchor)
     // opened, so there is nothing to show.
     const std::vector<MonitorInfo> monitors =
         recording ? std::vector<MonitorInfo>{} : EnumerateMonitors();
+    const std::vector<AudioDevice> mics =
+        recording ? std::vector<AudioDevice>{} : EnumerateMicrophones();
 
     HMENU menu = CreatePopupMenu();
     HMENU fps_menu = CreatePopupMenu();
     HMENU monitor_menu = CreatePopupMenu();
-    if (!menu || !fps_menu || !monitor_menu) {
+    HMENU mic_menu = CreatePopupMenu();
+    if (!menu || !fps_menu || !monitor_menu || !mic_menu) {
         if (menu) DestroyMenu(menu);
         if (fps_menu) DestroyMenu(fps_menu);
         if (monitor_menu) DestroyMenu(monitor_menu);
+        if (mic_menu) DestroyMenu(mic_menu);
         return;
     }
 
@@ -669,6 +692,53 @@ void App::ShowMenu(POINT anchor)
 
     AppendMenuW(menu, MF_STRING | (settings_.cursor ? MF_CHECKED : MF_UNCHECKED),
                 kMenuCursor, L"Show cursor");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+    // Locked while recording like framerate and monitor: the file's track list
+    // is fixed when it opens.
+    AppendMenuW(menu, MF_STRING | locked | (settings_.desktop_audio ? MF_CHECKED : MF_UNCHECKED),
+                kMenuDesktopAudio, L"Record desktop audio");
+    AppendMenuW(menu, MF_STRING | locked | (settings_.mic ? MF_CHECKED : MF_UNCHECKED),
+                kMenuMic, L"Record microphone");
+
+    const size_t mics_shown = (std::min)(mics.size(), static_cast<size_t>(kMenuMicMax));
+    const auto default_mic = std::find_if(mics.begin(), mics.end(),
+                                          [](const AudioDevice& d) { return d.is_default; });
+    const std::wstring default_label =
+        default_mic == mics.end() ? std::wstring(L"Default")
+                                  : L"Default (" + EscapeMenuText(default_mic->name) + L")";
+    AppendMenuW(mic_menu, MF_STRING, kMenuMicDefault, default_label.c_str());
+    if (!mics.empty()) {
+        AppendMenuW(mic_menu, MF_SEPARATOR, 0, nullptr);
+    }
+    UINT mic_checked = settings_.mic_device.empty() ? kMenuMicDefault : 0u;
+    for (size_t i = 0; i < mics_shown; ++i) {
+        const UINT id = kMenuMicFirst + static_cast<UINT>(i);
+        const std::wstring label = EscapeMenuText(mics[i].name);
+        AppendMenuW(mic_menu, MF_STRING, id, label.c_str());
+        if (mics[i].id == settings_.mic_device) {
+            mic_checked = id;
+        }
+    }
+    if (mic_checked != 0) {
+        // Radio groups need contiguous ids, which the default and the device
+        // list are not, so each item is checked on its own.
+        MENUITEMINFOW info{};
+        info.cbSize = sizeof(info);
+        info.fMask = MIIM_FTYPE | MIIM_STATE;
+        info.fType = MFT_RADIOCHECK;
+        info.fState = MFS_CHECKED;
+        SetMenuItemInfoW(mic_menu, mic_checked, FALSE, &info);
+    } else if (!recording) {
+        // The saved device is unplugged. Say so instead of implying the default
+        // is what will be used; a start fails until it is back or changed.
+        AppendMenuW(mic_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(mic_menu, MF_STRING | MF_GRAYED | MF_CHECKED, 0,
+                    L"Saved microphone (not connected)");
+    }
+    AppendMenuW(menu, MF_POPUP | locked, reinterpret_cast<UINT_PTR>(mic_menu), L"Microphone");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
     AppendMenuW(menu, MF_STRING, kMenuOpenFolder, L"Open recordings folder");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"Exit");
@@ -716,6 +786,16 @@ void App::ShowMenu(POINT anchor)
         settings_.cursor = !settings_.cursor;
         Persist();
         break;
+    case kMenuDesktopAudio:
+        ChooseAudio(settings_.desktop_audio, !settings_.desktop_audio, L"desktop audio",
+                    message);
+        break;
+    case kMenuMic:
+        ChooseAudio(settings_.mic, !settings_.mic, L"microphone", message);
+        break;
+    case kMenuMicDefault:
+        ChooseMicDevice(nullptr, message);
+        break;
     case kMenuOpenFolder:
         OpenRecordingsFolder();
         break;
@@ -725,6 +805,8 @@ void App::ShowMenu(POINT anchor)
     default:
         if (command >= kMenuMonitorFirst && command < kMenuMonitorFirst + shown) {
             ChooseMonitor(monitors[command - kMenuMonitorFirst], message);
+        } else if (command >= kMenuMicFirst && command < kMenuMicFirst + mics_shown) {
+            ChooseMicDevice(&mics[command - kMenuMicFirst], message);
         }
         break;
     }
@@ -772,6 +854,37 @@ bool App::ChooseMonitor(const MonitorInfo& monitor, std::wstring& message)
     monitor_label_ = monitor.friendly_name;
     Refresh();
     message = L"monitor " + monitor.friendly_name;
+    return true;
+}
+
+bool App::ChooseAudio(bool& setting, bool on, const wchar_t* what, std::wstring& message)
+{
+    if (setting != on) {
+        if (IsRecording()) {
+            message = std::wstring(L"cannot change ") + what + L" while recording";
+            return false;
+        }
+        setting = on;
+        Persist();
+    }
+    message = std::wstring(what) + (on ? L" on" : L" off");
+    return true;
+}
+
+/// nullptr means the default microphone, which is stored as an empty id so it
+/// follows whatever Windows calls the default later rather than pinning today's.
+bool App::ChooseMicDevice(const AudioDevice* device, std::wstring& message)
+{
+    const std::wstring id = device ? device->id : std::wstring{};
+    if (id != settings_.mic_device) {
+        if (IsRecording()) {
+            message = L"cannot change the microphone while recording";
+            return false;
+        }
+        settings_.mic_device = id;
+        Persist();
+    }
+    message = L"microphone " + (device ? device->name : std::wstring(L"default"));
     return true;
 }
 
@@ -882,6 +995,37 @@ void App::OnCommand(ipc::Request& request)
             reply = (ChooseMonitor(monitors[number - 1], message) ? L"ok " : L"err ")
                     + message;
         }
+    } else if (verb == L"set" && words.size() == 3
+               && (ToLower(words[1]) == L"desktop_audio" || ToLower(words[1]) == L"mic")) {
+        const bool desktop = ToLower(words[1]) == L"desktop_audio";
+        const std::wstring value = ToLower(words[2]);
+        std::wstring message;
+        if (value != L"on" && value != L"off") {
+            reply = L"err " + words[1] + L" must be on or off";
+        } else if (desktop) {
+            reply = (ChooseAudio(settings_.desktop_audio, value == L"on", L"desktop audio",
+                                 message) ? L"ok " : L"err ") + message;
+        } else {
+            reply = (ChooseAudio(settings_.mic, value == L"on", L"microphone", message)
+                         ? L"ok " : L"err ") + message;
+        }
+    } else if (verb == L"set" && words.size() == 3 && ToLower(words[1]) == L"mic_device") {
+        std::wstring message;
+        if (ToLower(words[2]) == L"default") {
+            reply = (ChooseMicDevice(nullptr, message) ? L"ok " : L"err ") + message;
+        } else {
+            uint32_t number = 0;
+            const std::vector<AudioDevice> mics = EnumerateMicrophones();
+            if (mics.empty()) {
+                reply = L"err no microphones found";
+            } else if (!ParseUint(words[2], number) || number == 0 || number > mics.size()) {
+                reply = L"err mic device must be default or 1 to "
+                        + std::to_wstring(mics.size()) + L"; see zcr --list-mics";
+            } else {
+                reply = (ChooseMicDevice(&mics[number - 1], message) ? L"ok " : L"err ")
+                        + message;
+            }
+        }
     } else {
         reply = L"err unknown request \"" + log::Abbrev(request.line, 60) + L"\"";
     }
@@ -925,9 +1069,11 @@ int App::Run(HINSTANCE instance)
     if (!detail.empty()) {
         log::Writef(L"settings: %s", detail.c_str());
     }
-    log::Writef(L"settings: %u fps, cursor %s, cq %u, max %u Mbps, output %s",
+    log::Writef(L"settings: %u fps, cursor %s, cq %u, max %u Mbps, desktop audio %s, "
+                L"mic %s, output %s",
                 settings_.fps, settings_.cursor ? L"on" : L"off", settings_.cq,
-                settings_.max_mbps, settings_.ResolvedOutputDir().c_str());
+                settings_.max_mbps, settings_.desktop_audio ? L"on" : L"off",
+                settings_.mic ? L"on" : L"off", settings_.ResolvedOutputDir().c_str());
 
     WNDCLASSEXW window_class{};
     window_class.cbSize = sizeof(window_class);

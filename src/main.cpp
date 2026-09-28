@@ -14,6 +14,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 #include <windows.h>
 
+#include "audio.h"
 #include "autostart.h"
 #include "diag_log.h"
 #include "ids.h"
@@ -71,20 +72,26 @@ void ShowUsage()
 {
     console::Write(
         L"zcr                           Run the tray instance.\r\n"
-        L"zcr --start [--fps N] [--monitor N]\r\n"
-        L"                              Start recording and print the output path.\r\n"
-        L"                              --fps and --monitor change the saved settings,\r\n"
-        L"                              the same as the tray menu does.\r\n"
+        L"zcr --start [options]         Start recording and print the output path.\r\n"
+        L"                              Options change the saved settings, the same\r\n"
+        L"                              as the tray menu does:\r\n"
+        L"                                --fps 30|60|120\r\n"
+        L"                                --monitor N\r\n"
+        L"                                --desktop-audio on|off\r\n"
+        L"                                --mic on|off\r\n"
+        L"                                --mic-device default|N\r\n"
         L"zcr --stop                    Stop recording and print the finished path.\r\n"
         L"zcr --toggle                  Print \"started <path>\" or \"stopped <path>\".\r\n"
         L"zcr --status                  Print \"idle\", \"recording <seconds>s <W>x<H>\r\n"
         L"                              <fps>fps HDR|SDR <monitor> <path>\" or\r\n"
         L"                              \"error <message>\".\r\n"
         L"zcr --quit                    Stop any recording and exit the tray instance.\r\n"
-        L"zcr --record-for SECONDS [--fps N] [--monitor N]\r\n"
+        L"zcr --record-for SECONDS [options]\r\n"
         L"                              Record for SECONDS, then print the finished path.\r\n"
         L"zcr --list-monitors           List displays. N for --monitor is the number in\r\n"
         L"                              the first column; * marks the primary.\r\n"
+        L"zcr --list-mics               List microphones. N for --mic-device is the\r\n"
+        L"                              number in the first column; * marks the default.\r\n"
         L"zcr --register-autostart      Start ZCR at sign-in (HKCU Run key).\r\n"
         L"zcr --unregister-autostart\r\n"
         L"zcr --help\r\n"
@@ -105,7 +112,23 @@ void ShowUsage()
 struct Options {
     std::optional<uint32_t> fps;
     std::optional<uint32_t> monitor;   // 1-based, as --list-monitors prints it
+    std::optional<bool> desktop_audio;
+    std::optional<bool> mic;
+    std::optional<std::wstring> mic_device;   // "default", or 1-based as --list-mics prints it
 };
+
+bool ParseOnOff(const std::wstring& text, bool& out)
+{
+    if (EqualsNoCase(text, L"on")) {
+        out = true;
+        return true;
+    }
+    if (EqualsNoCase(text, L"off")) {
+        out = false;
+        return true;
+    }
+    return false;
+}
 
 bool ParseUint(const std::wstring& text, uint32_t& out)
 {
@@ -137,7 +160,7 @@ bool ParseSeconds(const std::wstring& text, double& out)
     return true;
 }
 
-/// Reads --fps and --monitor from args[first..]. Anything else is an error,
+/// Reads the recording options from args[first..]. Anything else is an error,
 /// because a mistyped option silently ignored would record with the wrong
 /// settings and nobody would find out until playback.
 bool ParseOptions(const std::vector<std::wstring>& args, size_t first, Options& out,
@@ -147,13 +170,37 @@ bool ParseOptions(const std::vector<std::wstring>& args, size_t first, Options& 
         const std::wstring& arg = args[i];
         const bool is_fps = EqualsNoCase(arg, L"--fps");
         const bool is_monitor = EqualsNoCase(arg, L"--monitor");
-        if (!is_fps && !is_monitor) {
+        const bool is_desktop_audio = EqualsNoCase(arg, L"--desktop-audio");
+        const bool is_mic = EqualsNoCase(arg, L"--mic");
+        const bool is_mic_device = EqualsNoCase(arg, L"--mic-device");
+        if (!is_fps && !is_monitor && !is_desktop_audio && !is_mic && !is_mic_device) {
             error = L"unexpected argument \"" + arg + L"\"; see zcr --help";
             return false;
         }
         if (i + 1 >= args.size()) {
             error = arg + L" needs a value";
             return false;
+        }
+        if (is_desktop_audio || is_mic) {
+            bool on = false;
+            if (!ParseOnOff(args[i + 1], on)) {
+                error = arg + L" must be on or off, not \"" + args[i + 1] + L"\"";
+                return false;
+            }
+            (is_mic ? out.mic : out.desktop_audio) = on;
+            ++i;
+            continue;
+        }
+        if (is_mic_device) {
+            uint32_t number = 0;
+            if (!EqualsNoCase(args[i + 1], L"default")
+                && (!ParseUint(args[i + 1], number) || number == 0)) {
+                error = L"--mic-device must be default or a number from zcr --list-mics";
+                return false;
+            }
+            out.mic_device = args[i + 1];
+            ++i;
+            continue;
         }
         uint32_t value = 0;
         if (!ParseUint(args[i + 1], value)) {
@@ -277,18 +324,30 @@ bool EnsureRunning(std::wstring& error)
     return true;
 }
 
-/// Sends the --fps and --monitor changes ahead of a start.
+/// Sends the option changes ahead of a start.
 int ApplyOptions(const Options& options)
 {
-    std::wstring payload;
+    std::vector<std::wstring> requests;
     if (options.fps) {
-        const int code = Send(L"set fps " + std::to_wstring(*options.fps), payload);
-        if (code != kExitOk) {
-            return Fail(payload, code);
-        }
+        requests.push_back(L"set fps " + std::to_wstring(*options.fps));
     }
     if (options.monitor) {
-        const int code = Send(L"set monitor " + std::to_wstring(*options.monitor), payload);
+        requests.push_back(L"set monitor " + std::to_wstring(*options.monitor));
+    }
+    if (options.desktop_audio) {
+        requests.push_back(std::wstring(L"set desktop_audio ")
+                           + (*options.desktop_audio ? L"on" : L"off"));
+    }
+    if (options.mic) {
+        requests.push_back(std::wstring(L"set mic ") + (*options.mic ? L"on" : L"off"));
+    }
+    if (options.mic_device) {
+        requests.push_back(L"set mic_device " + *options.mic_device);
+    }
+
+    std::wstring payload;
+    for (const std::wstring& request : requests) {
+        const int code = Send(request, payload);
         if (code != kExitOk) {
             return Fail(payload, code);
         }
@@ -424,6 +483,27 @@ int CommandListMonitors(const std::vector<std::wstring>& args)
     return kExitOk;
 }
 
+int CommandListMics(const std::vector<std::wstring>& args)
+{
+    if (args.size() != 1) {
+        return Fail(L"unexpected argument \"" + args[1] + L"\"; see zcr --help");
+    }
+    const std::vector<AudioDevice> mics = EnumerateMicrophones();
+    if (mics.empty()) {
+        return Fail(L"no microphones found");
+    }
+
+    std::wstring out;
+    for (size_t i = 0; i < mics.size(); ++i) {
+        if (!out.empty()) {
+            out += L"\r\n";
+        }
+        out += std::to_wstring(i + 1) + (mics[i].is_default ? L"* " : L"  ") + mics[i].name;
+    }
+    console::Write(out);
+    return kExitOk;
+}
+
 int CommandAutostart(bool enable)
 {
     // Invoked by the installer through a hook declared as = "user", so it must
@@ -488,6 +568,9 @@ int Dispatch(HINSTANCE instance, const std::vector<std::wstring>& args)
     }
     if (EqualsNoCase(verb, L"--list-monitors")) {
         return CommandListMonitors(args);
+    }
+    if (EqualsNoCase(verb, L"--list-mics")) {
+        return CommandListMics(args);
     }
     if (EqualsNoCase(verb, L"--register-autostart")) {
         return CommandAutostart(true);

@@ -29,6 +29,9 @@ struct RecorderSettings {
     std::wstring output_dir;         // must exist or be creatable
     uint32_t cq = 24;
     uint32_t max_mbps = 0;           // 0 = derived from pixel rate
+    bool desktop_audio = false;      // loopback of the default output, its own track
+    bool mic = false;                // a capture endpoint, its own track
+    std::wstring mic_device;         // AudioDevice::id; empty = default microphone
 };
 
 enum class RecorderState {
@@ -48,6 +51,8 @@ struct RecorderStatus {
     uint32_t height = 0;
     bool hdr = false;
     std::wstring monitor;       // friendly name
+    bool desktop_audio = false; // tracks in the current recording
+    bool mic = false;
     uint64_t late_ticks = 0;    // pacer ticks that ran late enough to need catch-up
 };
 

@@ -14,6 +14,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 #include "recorder.h"
 
+#include "audio.h"
 #include "capture.h"
 #include "convert.h"
 #include "diag_log.h"
@@ -27,6 +28,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -50,6 +52,8 @@ constexpr size_t kRingSize = 8;
 /// would mean encoding seconds of duplicate frames in a burst; resynchronizing
 /// instead leaves a gap in wall-clock terms but keeps the file sane.
 constexpr double kResyncAfterSeconds = 1.0;
+
+constexpr uint64_t kAacFrameSamples = 1024;
 
 std::wstring HrText(HRESULT hr)
 {
@@ -195,6 +199,17 @@ struct Recorder::Impl {
     int part = 1;
     std::wstring first_path;
 
+    // Outlive every segment of a recording: a display mode change rolls the
+    // file over but the audio streams keep running, and each new segment
+    // attaches them afresh at its own origin.
+    AudioSource desktop_audio;
+    AudioSource mic_audio;
+    std::vector<AudioSource*> audio;   // in track order
+    // Frames written to the current segment per track, so a pacer resync can
+    // pick each track up exactly where its file timeline stands.
+    std::array<std::atomic<uint64_t>, 2> audio_frames{};
+
+
     std::thread session;
     std::atomic<bool> stop{false};
     std::atomic<bool> running{false};
@@ -276,15 +291,21 @@ struct Recorder::Impl {
             return false;
         }
 
+        std::vector<AudioTrackConfig> tracks;
+        for (const AudioSource* source : audio) {
+            tracks.push_back(source->TrackConfig());
+        }
+
         EnsureDirectory(settings.output_dir);
         seg->path = UniquePath(settings.output_dir, part);
-        if (!seg->mp4.Open(seg->path, seg->format, parameter_sets, error)) {
+        if (!seg->mp4.Open(seg->path, seg->format, parameter_sets, tracks, error)) {
             return false;
         }
 
-        log::Writef(L"recorder: segment %d %s  %ux%u@%u %s  %s", part, seg->path.c_str(),
-                    seg->format.width, seg->format.height, seg->format.fps,
-                    seg->format.hdr ? L"HDR" : L"SDR", monitor.friendly_name.c_str());
+        log::Writef(L"recorder: segment %d %s  %ux%u@%u %s  %s  %zu audio track(s)", part,
+                    seg->path.c_str(), seg->format.width, seg->format.height,
+                    seg->format.fps, seg->format.hdr ? L"HDR" : L"SDR",
+                    monitor.friendly_name.c_str(), tracks.size());
 
         {
             std::lock_guard lock(status_mu);
@@ -415,6 +436,78 @@ struct Recorder::Impl {
         return s.encoder.Submit(slot, index, error);
     }
 
+    // ----- audio -----------------------------------------------------------
+
+    /// Points every audio source at the current segment so that file time t of
+    /// each track sits at QPC time `origin + t`, the same mapping video uses.
+    /// `resume` continues tracks that already have frames in this segment,
+    /// after the pacer moved its origin, instead of starting them at zero.
+    void AttachAudio(double origin, bool resume = false)
+    {
+        Segment* s = segment.get();
+        for (size_t track = 0; track < audio.size(); ++track) {
+            std::atomic<uint64_t>& count = audio_frames[track];
+            if (!resume) {
+                count = 0;
+            }
+            const double sample_rate = audio[track]->TrackConfig().sample_rate;
+            const double start =
+                origin + static_cast<double>(count.load() * kAacFrameSamples) / sample_rate;
+            audio[track]->Attach(
+                [s, track, &count](const uint8_t* data, size_t size) {
+                    // A failed write here is the disk the video writer is
+                    // about to report too, so it is not reported twice.
+                    std::wstring ignored;
+                    if (s->mp4.WriteAudioFrame(track, data, size, ignored)) {
+                        ++count;
+                    }
+                },
+                start);
+        }
+    }
+
+    /// Blocks until each source has delivered its audio up to `end` into the
+    /// segment. Must run before CloseSegment: after it the sinks, which point
+    /// at that segment's writer, are never called again.
+    void DetachAudio(double end)
+    {
+        for (AudioSource* source : audio) {
+            source->Detach(end);
+        }
+    }
+
+    void StopAudio()
+    {
+        for (AudioSource* source : audio) {
+            source->Stop();
+        }
+        audio.clear();
+    }
+
+    bool StartAudio(std::wstring& error)
+    {
+        audio.clear();
+        if (settings.desktop_audio) {
+            if (!desktop_audio.Start(AudioSourceKind::Desktop, {}, error)) {
+                error = L"desktop audio: " + error;
+                return false;
+            }
+            audio.push_back(&desktop_audio);
+        }
+        if (settings.mic) {
+            if (!mic_audio.Start(AudioSourceKind::Microphone, settings.mic_device, error)) {
+                error = L"microphone: " + error;
+                StopAudio();
+                return false;
+            }
+            audio.push_back(&mic_audio);
+        }
+        std::lock_guard lock(status_mu);
+        status.desktop_audio = settings.desktop_audio;
+        status.mic = settings.mic;
+        return true;
+    }
+
     bool RollOver(std::wstring& error)
     {
         log::Write(L"recorder: display mode changed, starting a new segment");
@@ -456,6 +549,7 @@ struct Recorder::Impl {
         uint64_t index = 0;   // frame index within the current segment
         double period = 1.0 / segment->format.fps;
         double origin = QpcSeconds();
+        AttachAudio(origin);
 
         while (!stop) {
             const double deadline = origin + static_cast<double>(index) * period;
@@ -471,7 +565,12 @@ struct Recorder::Impl {
                 }
             } else if (-wait > kResyncAfterSeconds) {
                 log::Writef(L"recorder: pacer %.2f s behind, resynchronizing", -wait);
+                // Video skips the gap rather than filling it, so audio has to
+                // skip it too. Left alone it would fill the gap with silence
+                // and trail the picture by the length of the sleep from here on.
+                DetachAudio(origin + static_cast<double>(index) * period);
                 origin = QpcSeconds() - static_cast<double>(index) * period;
+                AttachAudio(origin, /*resume=*/true);
             } else if (-wait > period) {
                 std::lock_guard lock(status_mu);
                 ++status.late_ticks;
@@ -484,6 +583,9 @@ struct Recorder::Impl {
                 break;
             }
             if (cs == CaptureStatus::ModeChanged) {
+                // Audio ends where the video of this segment ends, so the
+                // next file does not open with a slice of the old one.
+                DetachAudio(origin + static_cast<double>(index) * period);
                 if (!RollOver(error)) {
                     failed = true;
                     break;
@@ -491,6 +593,7 @@ struct Recorder::Impl {
                 index = 0;
                 period = 1.0 / segment->format.fps;
                 origin = QpcSeconds();
+                AttachAudio(origin);
                 continue;
             }
 
@@ -502,7 +605,11 @@ struct Recorder::Impl {
         }
 
         // Finalize whatever exists, on failure too: the fragments written so
-        // far are a valid file and the only copy of the recording.
+        // far are a valid file and the only copy of the recording. A failed
+        // rollover leaves no segment, and the sources were detached before it.
+        if (segment) {
+            DetachAudio(origin + static_cast<double>(index) * period);
+        }
         std::wstring close_error;
         const bool closed = CloseSegment(close_error);
         if (!failed && !closed) {
@@ -510,6 +617,7 @@ struct Recorder::Impl {
             failed = true;
         }
         capture.Close();
+        StopAudio();
 
         if (mmcss) {
             AvRevertMmThreadCharacteristics(mmcss);
@@ -575,6 +683,7 @@ bool Recorder::Start(const RecorderSettings& settings, std::wstring& path_or_err
             std::wstring ignored;
             d.CloseSegment(ignored);
         }
+        d.StopAudio();
         d.ReleaseDevice();
         d.SetStatus(RecorderState::Error, why);
         path_or_error = why;
@@ -606,6 +715,12 @@ bool Recorder::Start(const RecorderSettings& settings, std::wstring& path_or_err
         return fail(error);
     }
     if (!d.capture.Open(d.device.Get(), d.monitor, error)) {
+        return fail(error);
+    }
+    // Before the segment, because the file's track list is fixed when it
+    // opens. A missing mic fails the start rather than recording without it:
+    // the person asked for that track and would only find out on playback.
+    if (!d.StartAudio(error)) {
         return fail(error);
     }
     if (!d.OpenSegment(error)) {
