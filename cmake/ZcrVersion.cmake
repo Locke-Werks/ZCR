@@ -4,7 +4,7 @@
 # installer.toml carries the same number and CI asserts the two agree, because
 # Forge stamps the installer from the TOML and cannot see this file.
 set(ZCR_VERSION_MAJOR 0)
-set(ZCR_VERSION_MINOR 1)
+set(ZCR_VERSION_MINOR 2)
 set(ZCR_VERSION_PATCH 0)
 
 set(ZCR_VERSION "${ZCR_VERSION_MAJOR}.${ZCR_VERSION_MINOR}.${ZCR_VERSION_PATCH}")
