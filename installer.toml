@@ -1,0 +1,133 @@
+# Forge installer configuration. Schema: Locke-Werks/Forge docs/config-schema.md
+#
+# The installer does what scripts/install.ps1 does, for someone without the
+# source: a per-user install to %LOCALAPPDATA%\Programs\ZCR, the user PATH, and
+# the HKCU Run key. Nothing here needs administrator rights.
+#
+# Paths use literal strings so a backslash stays a backslash. In a TOML basic
+# string every backslash starts an escape sequence.
+
+[product]
+name         = "ZCR"
+version      = "0.1.0"
+publisher    = "Locke Werks"
+description  = "Zero-copy HDR screen recorder for NVIDIA"
+copyright    = "Copyright (C) 2026 Locke Werks"
+url          = "https://github.com/Locke-Werks/ZCR"
+icon         = "assets/zcr.ico"
+# Stable across versions. Keys the single-instance mutex and the upgrade path, so
+# it must never change.
+upgrade_code = "80b24eec-c158-4776-a3d0-bc841c230b7c"
+
+# User scope, so on-demand is correct rather than a shortcut: every write lands in
+# the user's own profile and HKCU, and an elevated install would only put them in
+# the wrong one.
+[install]
+scope     = "user"
+dir       = '{LocalPrograms}\ZCR'
+elevation = "on-demand"
+
+[ui]
+license_text = """
+ZCR
+Copyright (C) 2026 Locke Werks
+
+This program is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this
+program. If not, see <https://www.gnu.org/licenses/>.
+
+The complete source is at https://github.com/Locke-Werks/ZCR
+"""
+
+[[preflight]]
+type = "os_build"
+min  = 22000
+fail = "ZCR needs Windows 11 or newer."
+
+# No process_not_running here. It would refuse the install before the pre_install
+# hook below got the chance to stop the running copy cleanly.
+
+[[preflight]]
+type  = "free_disk_space"
+bytes = 10485760
+fail  = "ZCR needs about 10 MB free on the install volume."
+
+[[options]]
+id      = "start_menu"
+label   = "Add a Start Menu shortcut"
+default = true
+
+[[options]]
+id      = "path"
+label   = "Add ZCR to my PATH"
+detail  = "So zcr --start, --stop and --status work from any shell."
+default = true
+
+[[options]]
+id      = "autostart"
+label   = "Start ZCR when I sign in"
+detail  = "Writes a Run entry to your own profile."
+default = true
+
+[[actions]]
+type   = "shortcut"
+target = '{InstallDir}\zcr.exe'
+name   = "ZCR"
+when   = "start_menu"
+
+[[actions]]
+type  = "path_append"
+value = '{InstallDir}'
+when  = "path"
+
+[[actions]]
+type = "arp"
+
+# zcr.exe is a single statically linked binary with in-box imports only, which is
+# what pre_install requires. --quit finalizes a recording in progress and waits
+# for the tray to exit; 2 means nothing was running.
+[[hooks.pre_install]]
+id          = "stop-running"
+run         = "payload:zcr.exe"
+args        = ["--quit"]
+sha256      = "auto"
+expect_exit = [0, 2]
+timeout_ms  = 20000
+vital       = false
+
+[[hooks.post_install]]
+id         = "register-autostart"
+run        = "payload:zcr.exe"
+args       = ["--register-autostart"]
+as         = "user"
+when       = "autostart"
+sha256     = "auto"
+timeout_ms = 15000
+vital      = false
+
+[[hooks.pre_uninstall]]
+id          = "stop-running"
+run         = "payload:zcr.exe"
+args        = ["--quit"]
+sha256      = "auto"
+expect_exit = [0, 2]
+timeout_ms  = 20000
+vital       = false
+
+[[hooks.pre_uninstall]]
+id         = "unregister-autostart"
+run        = "payload:zcr.exe"
+args       = ["--unregister-autostart"]
+as         = "user"
+when       = "autostart"
+sha256     = "auto"
+timeout_ms = 15000
+vital      = false

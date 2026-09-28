@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  # Same pin as release.yml, so the config lint below checks installer.toml
+  # against the lwforge that will actually package it.
+  FORGE_VERSION: v0.4.1
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No setup step and no vcvars. The preset names no generator, so CMake picks
+      # the newest Visual Studio on the box and that generator finds its own
+      # toolset. Pinning a VS year fails the day the runner image moves.
+      - name: Configure
+        run: cmake --preset ci
+
+      - name: Report the toolchain actually used
+        shell: pwsh
+        run: |
+          Select-String -Path build/ci/CMakeCache.txt -Pattern '^CMAKE_GENERATOR:|^CMAKE_CXX_COMPILER:|^ZCR_FXC:' |
+            ForEach-Object { $_.Line }
+
+      # /WX is on in this preset. A new warning stops the line here rather than
+      # on somebody's machine.
+      - name: Build
+        run: cmake --build --preset ci
+
+      # EXCLUDE_FROM_ALL, so the default build never compiles it. Built here so it
+      # does not rot. Not run: it needs an HEVC stream, and producing one needs
+      # NVENC, which a hosted runner does not have.
+      - name: Build mux_test
+        run: cmake --build --preset ci --target mux_test
+
+      # --config is required: the Visual Studio generator is multi-config, so the
+      # install rule cannot infer which one to take.
+      - name: Stage
+        shell: pwsh
+        run: |
+          cmake --install build/ci --config RelWithDebInfo --prefix stage
+          $exe = Get-Item stage/zcr.exe
+          "staged {0:N0} KB" -f ($exe.Length / 1KB)
+          if (-not $exe.Length) { throw "install produced nothing" }
+
+      # Static CRT, so the binary must not import a VC++ runtime. It also has to
+      # stay that way for the installer's pre_install hook, which runs zcr.exe
+      # before anything else is on disk.
+      #
+      # Scans the image itself rather than shelling out to dumpbin, which would
+      # mean hardcoding a Visual Studio path.
+      - name: Check for a runtime dependency
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path "stage/zcr.exe"))
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+
+          # Positive control first. If the scan cannot see the imports we know are
+          # there, it would report "no CRT" for any input at all.
+          $expected = [regex]::Matches($ascii, '(?i)\b(USER32|KERNEL32|SHELL32|ADVAPI32|D3D11)\.dll') |
+                      ForEach-Object { $_.Value.ToUpper() } | Sort-Object -Unique
+          "import names visible to the scan: $($expected -join ', ')"
+          if ($expected.Count -lt 5) {
+            throw "the import scan found only $($expected.Count) of the 5 system DLLs this binary certainly imports, so it is not reading the import table"
+          }
+
+          $crt = [regex]::Matches($ascii, '(?i)(VCRUNTIME\d*\.dll|MSVCP\d+\.dll|api-ms-win-crt-[a-z0-9-]+\.dll|ucrtbase\.dll)') |
+                 ForEach-Object { $_.Value } | Sort-Object -Unique
+          if ($crt) {
+            throw "the binary imports the C runtime ($($crt -join ', ')); the static CRT setting has been lost"
+          }
+          "no CRT import: statically linked"
+
+      # The release job asserts the tag matches both version strings. Checking
+      # they match each other on every push means a release never fails on a
+      # mismatch introduced weeks earlier.
+      - name: Check versions agree
+        shell: pwsh
+        run: |
+          $toml  = (Select-String -Path installer.toml -Pattern '^\s*version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $major = (Select-String -Path cmake/ZcrVersion.cmake -Pattern 'ZCR_VERSION_MAJOR (\d+)').Matches[0].Groups[1].Value
+          $minor = (Select-String -Path cmake/ZcrVersion.cmake -Pattern 'ZCR_VERSION_MINOR (\d+)').Matches[0].Groups[1].Value
+          $patch = (Select-String -Path cmake/ZcrVersion.cmake -Pattern 'ZCR_VERSION_PATCH (\d+)').Matches[0].Groups[1].Value
+          $cmake = "$major.$minor.$patch"
+          $exe   = (Get-Item stage/zcr.exe).VersionInfo.ProductVersion
+          "installer.toml=$toml  ZcrVersion.cmake=$cmake  linked exe=$exe"
+          if ($toml -ne $cmake) { throw "installer.toml $toml does not match ZcrVersion.cmake $cmake" }
+          if ($exe -notlike "$cmake*") { throw "linked VERSIONINFO $exe does not match ZcrVersion.cmake $cmake" }
+
+      # lwforge validates the config as it packages: an undeclared `when`, an
+      # unknown hook phase, a bad `as`. Doing it here moves those failures from tag
+      # time to push time. --dev because nothing in this job is signed.
+      - name: Lint the installer config
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download $env:FORGE_VERSION --repo Locke-Werks/Forge `
+            --pattern '*.exe' --dir tools
+          ./tools/lwforge.exe build `
+            --config installer.toml `
+            --payload stage `
+            --stub tools/lwstub.exe `
+            --out dist/ZCR-Setup.exe `
+            --dev
+          if ($LASTEXITCODE -ne 0) { throw "lwforge rejected installer.toml" }
+          ./tools/lwforge.exe inspect dist/ZCR-Setup.exe | Select-Object -First 12

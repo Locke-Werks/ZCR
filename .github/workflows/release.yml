@@ -1,0 +1,165 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  # Pinned. A Forge release cannot silently change what this job produces.
+  # v0.4.0 or later is required for [[hooks.pre_install]], which this product
+  # uses to stop the running tray before an upgrade swaps the exe.
+  FORGE_VERSION: v0.4.1
+
+jobs:
+  release:
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the version
+        shell: pwsh
+        run: |
+          $tag   = "${{ github.ref_name }}" -replace '^v', ''
+          $toml  = (Select-String -Path installer.toml -Pattern '^\s*version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $major = (Select-String -Path cmake/ZcrVersion.cmake -Pattern 'ZCR_VERSION_MAJOR (\d+)').Matches[0].Groups[1].Value
+          $minor = (Select-String -Path cmake/ZcrVersion.cmake -Pattern 'ZCR_VERSION_MINOR (\d+)').Matches[0].Groups[1].Value
+          $patch = (Select-String -Path cmake/ZcrVersion.cmake -Pattern 'ZCR_VERSION_PATCH (\d+)').Matches[0].Groups[1].Value
+          $cmake = "$major.$minor.$patch"
+          "tag=$tag  installer.toml=$toml  ZcrVersion.cmake=$cmake"
+          if ($tag -ne $toml)  { throw "tag $tag does not match installer.toml $toml" }
+          if ($tag -ne $cmake) { throw "tag $tag does not match cmake/ZcrVersion.cmake $cmake" }
+
+      - name: Build
+        run: |
+          cmake --preset release
+          cmake --build --preset release
+
+      # --config is required for a multi-config generator.
+      - name: Stage the payload
+        shell: pwsh
+        run: |
+          cmake --install build/release --config Release --prefix stage
+          Get-ChildItem stage | Format-Table Name, Length
+
+      # Sign the payload BEFORE forging. Forge hashes payload members into the
+      # container and extracts them verbatim, so an unsigned binary going in is
+      # still unsigned on the installed machine. This is also the portable asset.
+      - name: Sign the payload
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net
+          trusted-signing-account-name: specterpoint
+          certificate-profile-name: specterpoint
+          files-folder: stage
+          files-folder-filter: exe,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          # Certificates are valid for three days. Without the timestamp the
+          # signature stops validating within the week.
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify the payload signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature stage/zcr.exe
+          "payload: $($sig.Status)  $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "payload is $($sig.Status)" }
+
+      # lwstub.exe ships signed, which is what makes the embedded uninstaller
+      # signed without a second signing pass here. Forge is public, so the
+      # workflow's own token reads its releases.
+      - name: Fetch Forge
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download $env:FORGE_VERSION --repo Locke-Werks/Forge `
+            --pattern '*.exe' --dir tools
+          foreach ($name in 'lwforge.exe', 'lwstub.exe') {
+            $sig = Get-AuthenticodeSignature "tools/$name"
+            "$name : $($sig.Status)"
+            if ($sig.Status -ne 'Valid') { throw "tools/$name is $($sig.Status)" }
+          }
+
+      # No --sign here. That flag shells out to scripts/sign.ps1 resolved against
+      # the working directory, which only exists inside the Forge repo.
+      - name: Forge the installer
+        shell: pwsh
+        run: |
+          ./tools/lwforge.exe build `
+            --config installer.toml `
+            --payload stage `
+            --stub tools/lwstub.exe `
+            --out dist/ZCR-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw "lwforge build failed" }
+
+      # Signed last, after resource stamping and the container append have
+      # rewritten the image. The installer is the only file in dist/ at this
+      # point; the portable exe is copied in afterwards so it is not signed twice.
+      - name: Sign the installer
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net
+          trusted-signing-account-name: specterpoint
+          certificate-profile-name: specterpoint
+          files-folder: dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify the installer
+        shell: pwsh
+        run: |
+          Copy-Item stage/zcr.exe dist/zcr.exe
+
+          foreach ($name in 'ZCR-Setup.exe', 'zcr.exe') {
+            $sig = Get-AuthenticodeSignature "dist/$name"
+            "$name : $($sig.Status)  $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "dist/$name is $($sig.Status)" }
+          }
+
+          # Signing appended a certificate table after the container. This proves
+          # it did not orphan the payload.
+          ./tools/lwforge.exe inspect dist/ZCR-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw "the signed installer cannot read its own container" }
+
+      - name: Verify the option surface
+        shell: pwsh
+        run: |
+          $report = & dist/ZCR-Setup.exe --check-only /O:autostart=off /O:path=on /O:start_menu=on 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          $report
+
+          # An option id the installer does not declare is a real defect and must fail.
+          if ($report -match 'not declared|does not declare|unknown option') {
+            throw "the installer rejected an option id it is supposed to declare`n$report"
+          }
+
+          # Any other non-zero is the runner failing a preflight, which is a
+          # property of the runner rather than a defect in the installer. The
+          # os_build floor is Windows 11 and hosted runners are Server builds.
+          if ($code -ne 0) {
+            Write-Host "::warning::--check-only exited $code, which is expected when the runner itself fails a preflight"
+          }
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/ZCR-Setup.exe dist/zcr.exe `
+            --repo "${{ github.repository }}" `
+            --title "ZCR ${{ github.ref_name }}" `
+            --notes-file .github/release-notes.md
