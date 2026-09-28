@@ -25,7 +25,16 @@
 
 namespace zcr {
 
-/// Fragmented MP4 writer for one HEVC video track.
+/// One AAC-LC audio track. Every frame is 1024 samples, raw (no ADTS header).
+struct AudioTrackConfig {
+    uint32_t sample_rate = 48000;
+    uint32_t channels = 2;
+    uint32_t avg_bitrate = 0;               // bits per second, for esds
+    std::vector<uint8_t> specific_config;   // AudioSpecificConfig, 2 bytes for AAC-LC
+    std::wstring name;                      // hdlr name, shown as handler_name by ffprobe
+};
+
+/// Fragmented MP4 writer for one HEVC video track and zero or more AAC tracks.
 ///
 /// Why fragmented: every fragment is self-describing, so a crash, a kill or a
 /// power cut costs at most the fragment in progress (one GOP, 2 s) and the file
@@ -55,7 +64,20 @@ namespace zcr {
 ///
 /// Every sample has the same duration: 90000 / fps ticks (3000, 1500, 750).
 ///
-/// Not thread-safe: one writer thread.
+/// Audio tracks follow the video track (track ids 2, 3, ...), each with its own
+/// trak (mdhd timescale = sample rate, hdlr soun, smhd, stsd/mp4a/esds) and trex.
+/// Audio frames are buffered alongside video and go out in the same moof, one
+/// traf per track that has frames pending, when the next keyframe closes the
+/// fragment. Each audio traf's tfdt is the count of samples already written for
+/// that track, so each track is contiguous from time zero. Inside an mdat the
+/// audio bytes come before the video: trun's data_offset is a signed 32-bit
+/// field, and audio placed behind a GOP over 2 GB could not be addressed. If
+/// video stops producing keyframes, more than about 10 s of pending audio is
+/// written as an audio-only fragment rather than held in memory.
+///
+/// WriteSample and Close are called from one writer thread. WriteAudioFrame is
+/// called from the audio capture threads; an internal mutex serializes all
+/// three.
 class Mp4Writer {
 public:
     Mp4Writer();
@@ -68,6 +90,18 @@ public:
     /// SequenceHeader returns it.
     bool Open(const std::wstring& path, const VideoFormat& format,
               const std::vector<uint8_t>& parameter_sets, std::wstring& error);
+
+    /// As above, plus one AAC track per entry of `audio`, in that order.
+    bool Open(const std::wstring& path, const VideoFormat& format,
+              const std::vector<uint8_t>& parameter_sets,
+              const std::vector<AudioTrackConfig>& audio, std::wstring& error);
+
+    /// Appends one raw AAC frame to audio track `track` (an index into the
+    /// `audio` list given to Open). Frame k of a track covers samples
+    /// [k*1024, (k+1)*1024) of the file timeline. Returns false when the writer
+    /// is not open or a write has failed; the caller treats that as a dropped
+    /// frame, since the video side reports the same failure.
+    bool WriteAudioFrame(size_t track, const uint8_t* data, size_t size, std::wstring& error);
 
     /// Appends one access unit (Annex B). The first sample must be a keyframe.
     /// Buffers the current fragment in memory and writes it out (moof + mdat

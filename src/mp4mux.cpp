@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 
 namespace zcr {
 namespace {
@@ -26,6 +27,15 @@ namespace {
 constexpr uint32_t kMovieTimescale = 1000;
 constexpr uint32_t kTrackTimescale = 90000;
 constexpr uint32_t kTrackId = 1;
+constexpr uint32_t kFirstAudioTrackId = kTrackId + 1;
+
+constexpr uint32_t kAacFrameSamples = 1024;
+
+// About 10 s of 48 kHz AAC. Audio normally rides out with the video fragment
+// its keyframe closes; this only matters when video stops arriving at all, and
+// then an audio-only fragment keeps the buffer from growing for as long as the
+// stall lasts.
+constexpr size_t kMaxPendingAudioFrames = 470;
 
 constexpr uint8_t kNalVps = 32;
 constexpr uint8_t kNalSps = 33;
@@ -39,6 +49,7 @@ constexpr uint32_t kSyncSampleFlags = 0x02000000;
 constexpr uint32_t kNonSyncSampleFlags = 0x01010000;
 
 constexpr uint32_t kTfhdDefaultSampleDuration = 0x000008;
+constexpr uint32_t kTfhdDefaultSampleFlags = 0x000020;
 constexpr uint32_t kTfhdDefaultBaseIsMoof = 0x020000;
 constexpr uint32_t kTrunDataOffset = 0x000001;
 constexpr uint32_t kTrunSampleSize = 0x000200;
@@ -129,6 +140,43 @@ void WriteUnityMatrix(Bytes& b)
     for (uint32_t v : matrix) {
         b.U32(v);
     }
+}
+
+/// ISO/IEC 14496-1 descriptors store their size in 7-bit groups. The four-byte
+/// form is always used, as ffmpeg does, so the size can be patched afterwards
+/// the same way a box size is.
+[[nodiscard]] size_t BeginDescriptor(Bytes& b, uint8_t tag)
+{
+    b.U8(tag);
+    const size_t start = b.Size();
+    b.U32(0);
+    return start;
+}
+
+void EndDescriptor(Bytes& b, size_t start)
+{
+    const size_t size = b.Size() - start - 4;
+    std::vector<uint8_t>& raw = b.Raw();
+    raw[start] = static_cast<uint8_t>(0x80 | ((size >> 21) & 0x7F));
+    raw[start + 1] = static_cast<uint8_t>(0x80 | ((size >> 14) & 0x7F));
+    raw[start + 2] = static_cast<uint8_t>(0x80 | ((size >> 7) & 0x7F));
+    raw[start + 3] = static_cast<uint8_t>(size & 0x7F);
+}
+
+[[nodiscard]] std::string ToUtf8(const std::wstring& text)
+{
+    if (text.empty()) {
+        return {};
+    }
+    const int length = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                           nullptr, 0, nullptr, nullptr);
+    if (length <= 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(),
+                        length, nullptr, nullptr);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,45 +431,69 @@ struct Mp4Writer::Impl {
         uint64_t moof_offset = 0;
     };
 
-    Handle file;
-    std::wstring path;
-    VideoFormat format;
-    bool open = false;
-    bool failed = false;
+    struct AudioTrack {
+        AudioTrackConfig config;
+        std::vector<uint8_t> payload; // frames waiting for the next fragment
+        std::vector<uint32_t> sizes;
+        uint64_t decode_time = 0; // samples of every frame already on disk
+        size_t data_offset_at = 0; // trun data_offset in the moof being built
+    };
 
-    uint32_t sample_duration = 0;
-    uint64_t mehd_value_offset = 0;
-    uint64_t file_size = 0;
-    uint64_t decode_time = 0; // ticks of every sample already on disk
-    uint32_t sequence = 0;
-    uint64_t sample_count = 0;
+    // Everything one open file owns. It sits apart from the mutex so Open can
+    // reset it with a single assignment; a std::mutex can be neither copied
+    // nor moved.
+    struct State {
+        Handle file;
+        std::wstring path;
+        VideoFormat format;
+        bool open = false;
+        bool failed = false;
 
-    // The fragment being accumulated. Only its first sample is a keyframe,
-    // since a keyframe is what closes the previous fragment.
-    std::vector<uint8_t> payload;
-    std::vector<uint32_t> sizes;
-    Bytes staging;
+        uint32_t sample_duration = 0;
+        uint64_t mehd_value_offset = 0;
+        uint64_t file_size = 0;
+        uint64_t decode_time = 0; // ticks of every sample already on disk
+        uint32_t sequence = 0;
+        uint64_t sample_count = 0;
 
-    std::vector<Fragment> fragments;
+        // The fragment being accumulated. Only its first sample is a keyframe,
+        // since a keyframe is what closes the previous fragment.
+        std::vector<uint8_t> payload;
+        std::vector<uint32_t> sizes;
+        Bytes staging;
 
-    [[nodiscard]] std::wstring Failure(const wchar_t* what, DWORD code) const
-    {
-        return std::wstring(what) + L" failed on " + path + L": " + Win32Message(code);
-    }
+        std::vector<AudioTrack> audio;
+        std::vector<Fragment> fragments;
 
-    bool Write(const uint8_t* data, size_t size, std::wstring& error)
-    {
-        DWORD code = 0;
-        if (!WriteAll(file.Get(), data, size, code)) {
-            failed = true;
-            error = Failure(L"WriteFile", code);
-            return false;
+        [[nodiscard]] std::wstring Failure(const wchar_t* what, DWORD code) const
+        {
+            return std::wstring(what) + L" failed on " + path + L": " + Win32Message(code);
         }
-        file_size += size;
-        return true;
-    }
 
-    bool FlushFragment(std::wstring& error);
+        bool Write(const uint8_t* data, size_t size, std::wstring& error)
+        {
+            DWORD code = 0;
+            if (!WriteAll(file.Get(), data, size, code)) {
+                failed = true;
+                error = Failure(L"WriteFile", code);
+                return false;
+            }
+            file_size += size;
+            return true;
+        }
+
+        /// Writes every pending audio frame, and the pending video samples too
+        /// unless `with_video` is false. Only a keyframe may start a video
+        /// fragment, so the audio-only flush has to leave the GOP in progress
+        /// where it is.
+        bool FlushFragment(bool with_video, std::wstring& error);
+
+        /// Longest track, in movie timescale units, for mehd.
+        [[nodiscard]] uint64_t DurationMs() const;
+    };
+
+    std::mutex mutex;
+    State state;
 };
 
 namespace {
@@ -523,10 +595,157 @@ void WriteSampleEntry(Bytes& b, const VideoFormat& format, const SpsInfo& sps,
     b.End(entry);
 }
 
+void WriteLanguageUnd(Bytes& b)
+{
+    // 'und' packed as three 5-bit letters offset from 0x60.
+    b.U16((('u' - 0x60) << 10) | (('n' - 0x60) << 5) | ('d' - 0x60));
+}
+
+void WriteDataInformation(Bytes& b)
+{
+    const size_t dinf = b.Begin("dinf");
+    const size_t dref = b.BeginFull("dref", 0, 0);
+    b.U32(1);
+    const size_t url = b.BeginFull("url ", 0, 1); // media is in this file
+    b.End(url);
+    b.End(dref);
+    b.End(dinf);
+}
+
+/// stts, stsc, stsz and stco with no entries: every sample lives in a fragment.
+void WriteEmptySampleTables(Bytes& b)
+{
+    const size_t stts = b.BeginFull("stts", 0, 0);
+    b.U32(0);
+    b.End(stts);
+    const size_t stsc = b.BeginFull("stsc", 0, 0);
+    b.U32(0);
+    b.End(stsc);
+    const size_t stsz = b.BeginFull("stsz", 0, 0);
+    b.U32(0);
+    b.U32(0);
+    b.End(stsz);
+    const size_t stco = b.BeginFull("stco", 0, 0);
+    b.U32(0);
+    b.End(stco);
+}
+
+void WriteTrex(Bytes& b, uint32_t track_id)
+{
+    const size_t trex = b.BeginFull("trex", 0, 0);
+    b.U32(track_id);
+    b.U32(1); // default_sample_description_index
+    b.U32(0);
+    b.U32(0);
+    b.U32(0);
+    b.End(trex);
+}
+
+/// ISO/IEC 14496-14 esds around a DecoderConfigDescriptor for AAC.
+void WriteEsds(Bytes& b, const AudioTrackConfig& config)
+{
+    const size_t esds = b.BeginFull("esds", 0, 0);
+    const size_t es = BeginDescriptor(b, 0x03);
+    b.U16(0); // ES_ID: 14496-14 says 0 in the file, the track id identifies it
+    b.U8(0);  // no stream dependence, URL or OCR stream
+
+    const size_t dcd = BeginDescriptor(b, 0x04);
+    b.U8(0x40); // objectTypeIndication: MPEG-4 Audio
+    b.U8(0x15); // streamType 5 (audio) << 2, upStream 0, reserved 1
+    // 6144 bits per channel is the most one raw_data_block may hold, so this
+    // bounds every frame without having seen any.
+    b.U24(768 * config.channels);
+    b.U32(config.avg_bitrate); // maxBitrate
+    b.U32(config.avg_bitrate);
+
+    const size_t dsi = BeginDescriptor(b, 0x05);
+    b.Append(config.specific_config.data(), config.specific_config.size());
+    EndDescriptor(b, dsi);
+    EndDescriptor(b, dcd);
+
+    const size_t sl = BeginDescriptor(b, 0x06);
+    b.U8(2); // predefined: reserved for MP4 files
+    EndDescriptor(b, sl);
+
+    EndDescriptor(b, es);
+    b.End(esds);
+}
+
+void WriteAudioTrak(Bytes& b, const AudioTrackConfig& config, uint32_t track_id)
+{
+    const size_t trak = b.Begin("trak");
+    const size_t tkhd = b.BeginFull("tkhd", 0, 0x3); // enabled | in_movie
+    b.U32(0);
+    b.U32(0);
+    b.U32(track_id);
+    b.U32(0); // reserved
+    b.U32(0); // duration
+    b.Zeros(8);
+    b.U16(0); // layer
+    // One shared group: a player picks a single audio track to play, while an
+    // editor still sees desktop and microphone as separate tracks.
+    b.U16(1);
+    b.U16(0x0100); // volume 1.0
+    b.U16(0);
+    WriteUnityMatrix(b);
+    b.U32(0); // width
+    b.U32(0); // height
+    b.End(tkhd);
+
+    const size_t mdia = b.Begin("mdia");
+    const size_t mdhd = b.BeginFull("mdhd", 0, 0);
+    b.U32(0);
+    b.U32(0);
+    b.U32(config.sample_rate);
+    b.U32(0);
+    WriteLanguageUnd(b);
+    b.U16(0);
+    b.End(mdhd);
+
+    const size_t hdlr = b.BeginFull("hdlr", 0, 0);
+    b.U32(0);
+    b.Tag("soun");
+    b.Zeros(12);
+    const std::string name = ToUtf8(config.name);
+    b.Append(name.c_str(), name.size() + 1);
+    b.End(hdlr);
+
+    const size_t minf = b.Begin("minf");
+    const size_t smhd = b.BeginFull("smhd", 0, 0);
+    b.U16(0); // balance
+    b.U16(0); // reserved
+    b.End(smhd);
+
+    WriteDataInformation(b);
+
+    const size_t stbl = b.Begin("stbl");
+    const size_t stsd = b.BeginFull("stsd", 0, 0);
+    b.U32(1);
+    const size_t entry = b.Begin("mp4a");
+    b.Zeros(6); // reserved
+    b.U16(1);   // data_reference_index
+    b.Zeros(8); // reserved
+    b.U16(config.channels);
+    b.U16(16); // samplesize
+    b.U16(0);  // pre_defined
+    b.U16(0);  // reserved
+    b.U32(config.sample_rate << 16);
+    WriteEsds(b, config);
+    b.End(entry);
+    b.End(stsd);
+    WriteEmptySampleTables(b);
+    b.End(stbl);
+
+    b.End(minf);
+    b.End(mdia);
+    b.End(trak);
+}
+
 /// ftyp + moov. Returns the offset of mehd's fragment_duration within `b`, so
 /// Close can patch it once the length is known.
 [[nodiscard]] size_t WriteHeader(Bytes& b, const VideoFormat& format, const SpsInfo& sps,
-                                 const std::vector<std::vector<uint8_t>> (&arrays)[3])
+                                 const std::vector<std::vector<uint8_t>> (&arrays)[3],
+                                 const std::vector<AudioTrackConfig>& audio)
 {
     const size_t ftyp = b.Begin("ftyp");
     b.Tag("isom");
@@ -548,7 +767,7 @@ void WriteSampleEntry(Bytes& b, const VideoFormat& format, const SpsInfo& sps,
     b.Zeros(10);
     WriteUnityMatrix(b);
     b.Zeros(24); // pre_defined
-    b.U32(kTrackId + 1); // next_track_ID
+    b.U32(kFirstAudioTrackId + static_cast<uint32_t>(audio.size())); // next_track_ID
     b.End(mvhd);
 
     const size_t trak = b.Begin("trak");
@@ -574,8 +793,7 @@ void WriteSampleEntry(Bytes& b, const VideoFormat& format, const SpsInfo& sps,
     b.U32(0);
     b.U32(kTrackTimescale);
     b.U32(0);
-    // 'und' packed as three 5-bit letters offset from 0x60.
-    b.U16((('u' - 0x60) << 10) | (('n' - 0x60) << 5) | ('d' - 0x60));
+    WriteLanguageUnd(b);
     b.U16(0);
     b.End(mdhd);
 
@@ -591,50 +809,33 @@ void WriteSampleEntry(Bytes& b, const VideoFormat& format, const SpsInfo& sps,
     b.Zeros(8); // graphicsmode + opcolor
     b.End(vmhd);
 
-    const size_t dinf = b.Begin("dinf");
-    const size_t dref = b.BeginFull("dref", 0, 0);
-    b.U32(1);
-    const size_t url = b.BeginFull("url ", 0, 1); // media is in this file
-    b.End(url);
-    b.End(dref);
-    b.End(dinf);
+    WriteDataInformation(b);
 
     const size_t stbl = b.Begin("stbl");
     const size_t stsd = b.BeginFull("stsd", 0, 0);
     b.U32(1);
     WriteSampleEntry(b, format, sps, arrays);
     b.End(stsd);
-    const size_t stts = b.BeginFull("stts", 0, 0);
-    b.U32(0);
-    b.End(stts);
-    const size_t stsc = b.BeginFull("stsc", 0, 0);
-    b.U32(0);
-    b.End(stsc);
-    const size_t stsz = b.BeginFull("stsz", 0, 0);
-    b.U32(0);
-    b.U32(0);
-    b.End(stsz);
-    const size_t stco = b.BeginFull("stco", 0, 0);
-    b.U32(0);
-    b.End(stco);
+    WriteEmptySampleTables(b);
     b.End(stbl);
 
     b.End(minf);
     b.End(mdia);
     b.End(trak);
 
+    for (size_t i = 0; i < audio.size(); ++i) {
+        WriteAudioTrak(b, audio[i], kFirstAudioTrackId + static_cast<uint32_t>(i));
+    }
+
     const size_t mvex = b.Begin("mvex");
     const size_t mehd = b.BeginFull("mehd", 1, 0);
     const size_t mehd_value = b.Size();
     b.U64(0);
     b.End(mehd);
-    const size_t trex = b.BeginFull("trex", 0, 0);
-    b.U32(kTrackId);
-    b.U32(1); // default_sample_description_index
-    b.U32(0);
-    b.U32(0);
-    b.U32(0);
-    b.End(trex);
+    WriteTrex(b, kTrackId);
+    for (size_t i = 0; i < audio.size(); ++i) {
+        WriteTrex(b, kFirstAudioTrackId + static_cast<uint32_t>(i));
+    }
     b.End(mvex);
 
     b.End(moov);
@@ -643,9 +844,18 @@ void WriteSampleEntry(Bytes& b, const VideoFormat& format, const SpsInfo& sps,
 
 } // namespace
 
-bool Mp4Writer::Impl::FlushFragment(std::wstring& error)
+bool Mp4Writer::Impl::State::FlushFragment(bool with_video, std::wstring& error)
 {
-    if (sizes.empty()) {
+    const bool video = with_video && !sizes.empty();
+    size_t audio_bytes = 0;
+    bool any_audio = false;
+    for (const AudioTrack& track : audio) {
+        if (!track.sizes.empty()) {
+            any_audio = true;
+            audio_bytes += track.payload.size();
+        }
+    }
+    if (!video && !any_audio) {
         return true;
     }
 
@@ -659,55 +869,128 @@ bool Mp4Writer::Impl::FlushFragment(std::wstring& error)
     b.U32(++sequence);
     b.End(mfhd);
 
-    const size_t traf = b.Begin("traf");
-    const size_t tfhd = b.BeginFull("tfhd", 0, kTfhdDefaultBaseIsMoof | kTfhdDefaultSampleDuration);
-    b.U32(kTrackId);
-    b.U32(sample_duration);
-    b.End(tfhd);
+    size_t video_offset_at = 0;
+    if (video) {
+        const size_t traf = b.Begin("traf");
+        const size_t tfhd =
+            b.BeginFull("tfhd", 0, kTfhdDefaultBaseIsMoof | kTfhdDefaultSampleDuration);
+        b.U32(kTrackId);
+        b.U32(sample_duration);
+        b.End(tfhd);
 
-    const size_t tfdt = b.BeginFull("tfdt", 1, 0);
-    b.U64(base_time);
-    b.End(tfdt);
+        const size_t tfdt = b.BeginFull("tfdt", 1, 0);
+        b.U64(base_time);
+        b.End(tfdt);
 
-    const size_t trun = b.BeginFull("trun", 0, kTrunDataOffset | kTrunSampleSize | kTrunSampleFlags);
-    b.U32(static_cast<uint32_t>(sizes.size()));
-    const size_t data_offset_at = b.Size();
-    b.U32(0);
-    for (size_t i = 0; i < sizes.size(); ++i) {
-        b.U32(sizes[i]);
-        b.U32(i == 0 ? kSyncSampleFlags : kNonSyncSampleFlags);
+        const size_t trun =
+            b.BeginFull("trun", 0, kTrunDataOffset | kTrunSampleSize | kTrunSampleFlags);
+        b.U32(static_cast<uint32_t>(sizes.size()));
+        video_offset_at = b.Size();
+        b.U32(0);
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            b.U32(sizes[i]);
+            b.U32(i == 0 ? kSyncSampleFlags : kNonSyncSampleFlags);
+        }
+        b.End(trun);
+        b.End(traf);
     }
-    b.End(trun);
-    b.End(traf);
+
+    for (size_t t = 0; t < audio.size(); ++t) {
+        AudioTrack& track = audio[t];
+        if (track.sizes.empty()) {
+            continue;
+        }
+        const size_t traf = b.Begin("traf");
+        // Every AAC frame is a sync sample of the same length, so both go in
+        // tfhd and the trun only carries sizes.
+        const size_t tfhd = b.BeginFull(
+            "tfhd", 0,
+            kTfhdDefaultBaseIsMoof | kTfhdDefaultSampleDuration | kTfhdDefaultSampleFlags);
+        b.U32(kFirstAudioTrackId + static_cast<uint32_t>(t));
+        b.U32(kAacFrameSamples);
+        b.U32(kSyncSampleFlags);
+        b.End(tfhd);
+
+        const size_t tfdt = b.BeginFull("tfdt", 1, 0);
+        b.U64(track.decode_time);
+        b.End(tfdt);
+
+        const size_t trun = b.BeginFull("trun", 0, kTrunDataOffset | kTrunSampleSize);
+        b.U32(static_cast<uint32_t>(track.sizes.size()));
+        track.data_offset_at = b.Size();
+        b.U32(0);
+        for (uint32_t size : track.sizes) {
+            b.U32(size);
+        }
+        b.End(trun);
+        b.End(traf);
+    }
     b.End(moof);
 
     const size_t moof_size = b.Size();
-    const bool large = payload.size() > UINT32_MAX - 8;
+    const uint64_t payload_size = audio_bytes + (video ? payload.size() : 0);
+    const bool large = payload_size > UINT32_MAX - 8;
     const size_t mdat_header = large ? 16 : 8;
-    b.PatchU32(data_offset_at, static_cast<uint32_t>(moof_size + mdat_header));
     if (large) {
         b.U32(1);
         b.Tag("mdat");
-        b.U64(payload.size() + 16);
+        b.U64(payload_size + 16);
     } else {
-        b.U32(static_cast<uint32_t>(payload.size() + 8));
+        b.U32(static_cast<uint32_t>(payload_size + 8));
         b.Tag("mdat");
     }
 
+    // Audio goes ahead of video in the mdat. trun's data_offset is a signed
+    // 32-bit field, and audio behind a GOP over 2 GB would be out of its
+    // reach; a few hundred kilobytes of audio in front keeps every offset
+    // small whatever the video bitrate.
+    //
     // One WriteFile per fragment, so a crash can only ever leave a torn tail,
     // never a moof on disk whose mdat is missing from the middle of the file.
     // That means copying the payload behind the moof; at recording bitrates it
     // is a few megabytes every two seconds.
-    b.Append(payload.data(), payload.size());
+    size_t data_offset = moof_size + mdat_header;
+    for (AudioTrack& track : audio) {
+        if (track.sizes.empty()) {
+            continue;
+        }
+        b.PatchU32(track.data_offset_at, static_cast<uint32_t>(data_offset));
+        b.Append(track.payload.data(), track.payload.size());
+        data_offset += track.payload.size();
+    }
+    if (video) {
+        b.PatchU32(video_offset_at, static_cast<uint32_t>(data_offset));
+        b.Append(payload.data(), payload.size());
+    }
     if (!Write(b.Data(), b.Size(), error)) {
         return false;
     }
 
-    fragments.push_back({base_time, moof_offset});
-    decode_time += static_cast<uint64_t>(sample_duration) * sizes.size();
-    payload.clear();
-    sizes.clear();
+    for (AudioTrack& track : audio) {
+        track.decode_time += static_cast<uint64_t>(kAacFrameSamples) * track.sizes.size();
+        track.payload.clear();
+        track.sizes.clear();
+    }
+    if (video) {
+        // tfra indexes video only, and its entries say the video traf is the
+        // first in the moof; audio-only fragments are not seek points.
+        fragments.push_back({base_time, moof_offset});
+        decode_time += static_cast<uint64_t>(sample_duration) * sizes.size();
+        payload.clear();
+        sizes.clear();
+    }
     return true;
+}
+
+uint64_t Mp4Writer::Impl::State::DurationMs() const
+{
+    uint64_t longest =
+        (decode_time * kMovieTimescale + kTrackTimescale / 2) / kTrackTimescale;
+    for (const AudioTrack& track : audio) {
+        const uint64_t rate = track.config.sample_rate;
+        longest = std::max(longest, (track.decode_time * kMovieTimescale + rate / 2) / rate);
+    }
+    return longest;
 }
 
 Mp4Writer::Mp4Writer() : impl_(std::make_unique<Impl>()) {}
@@ -721,7 +1004,15 @@ Mp4Writer::~Mp4Writer()
 bool Mp4Writer::Open(const std::wstring& path, const VideoFormat& format,
                      const std::vector<uint8_t>& parameter_sets, std::wstring& error)
 {
-    Impl& s = *impl_;
+    return Open(path, format, parameter_sets, {}, error);
+}
+
+bool Mp4Writer::Open(const std::wstring& path, const VideoFormat& format,
+                     const std::vector<uint8_t>& parameter_sets,
+                     const std::vector<AudioTrackConfig>& audio, std::wstring& error)
+{
+    std::lock_guard lock(impl_->mutex);
+    Impl::State& s = impl_->state;
     if (s.open) {
         error = L"MP4 writer is already open on " + s.path;
         return false;
@@ -757,8 +1048,27 @@ bool Mp4Writer::Open(const std::wstring& path, const VideoFormat& format,
         return false;
     }
 
+    for (size_t i = 0; i < audio.size(); ++i) {
+        const AudioTrackConfig& a = audio[i];
+        const std::wstring which = L"MP4 writer: audio track " + std::to_wstring(i);
+        // mp4a carries the rate as 16.16 fixed point.
+        if (a.sample_rate == 0 || a.sample_rate > 0xFFFF) {
+            error = which + L" has sample rate " + std::to_wstring(a.sample_rate)
+                + L", which the mp4a sample entry cannot hold";
+            return false;
+        }
+        if (a.channels == 0 || a.channels > 8) {
+            error = which + L" has " + std::to_wstring(a.channels) + L" channels";
+            return false;
+        }
+        if (a.specific_config.empty()) {
+            error = which + L" has no AudioSpecificConfig";
+            return false;
+        }
+    }
+
     Bytes header;
-    const size_t mehd_value = WriteHeader(header, format, sps, arrays);
+    const size_t mehd_value = WriteHeader(header, format, sps, arrays, audio);
 
     Handle file(CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
@@ -768,12 +1078,16 @@ bool Mp4Writer::Open(const std::wstring& path, const VideoFormat& format,
         return false;
     }
 
-    s = Impl{};
+    s = Impl::State{};
     s.file = std::move(file);
     s.path = path;
     s.format = format;
     s.sample_duration = kTrackTimescale / format.fps;
     s.mehd_value_offset = mehd_value;
+    s.audio.resize(audio.size());
+    for (size_t i = 0; i < audio.size(); ++i) {
+        s.audio[i].config = audio[i];
+    }
     s.open = true;
 
     if (!s.Write(header.Data(), header.Size(), error)) {
@@ -785,10 +1099,43 @@ bool Mp4Writer::Open(const std::wstring& path, const VideoFormat& format,
     return true;
 }
 
+bool Mp4Writer::WriteAudioFrame(size_t track, const uint8_t* data, size_t size,
+                                std::wstring& error)
+{
+    std::lock_guard lock(impl_->mutex);
+    Impl::State& s = impl_->state;
+    if (!s.open) {
+        error = L"MP4 writer is not open";
+        return false;
+    }
+    if (s.failed) {
+        error = L"MP4 writer: an earlier write to " + s.path + L" failed";
+        return false;
+    }
+    if (track >= s.audio.size()) {
+        error = L"MP4 writer: there is no audio track " + std::to_wstring(track);
+        return false;
+    }
+    if (size == 0 || size > UINT32_MAX) {
+        error = L"MP4 writer: audio frame of " + std::to_wstring(size) + L" bytes";
+        return false;
+    }
+
+    Impl::AudioTrack& t = s.audio[track];
+    t.payload.insert(t.payload.end(), data, data + size);
+    t.sizes.push_back(static_cast<uint32_t>(size));
+
+    if (t.sizes.size() > kMaxPendingAudioFrames) {
+        return s.FlushFragment(false, error);
+    }
+    return true;
+}
+
 bool Mp4Writer::WriteSample(const uint8_t* annexb, size_t size, bool keyframe,
                             std::wstring& error)
 {
-    Impl& s = *impl_;
+    std::lock_guard lock(impl_->mutex);
+    Impl::State& s = impl_->state;
     if (!s.open) {
         error = L"MP4 writer is not open";
         return false;
@@ -802,7 +1149,10 @@ bool Mp4Writer::WriteSample(const uint8_t* annexb, size_t size, bool keyframe,
         return false;
     }
 
-    if (keyframe && !s.FlushFragment(error)) {
+    // With no video pending there is nothing for the keyframe to close. Audio
+    // that arrived before it waits, and goes out with this GOP rather than in
+    // a fragment of its own.
+    if (keyframe && !s.sizes.empty() && !s.FlushFragment(true, error)) {
         return false;
     }
 
@@ -831,7 +1181,8 @@ bool Mp4Writer::WriteSample(const uint8_t* annexb, size_t size, bool keyframe,
 
 bool Mp4Writer::Close(std::wstring& error)
 {
-    Impl& s = *impl_;
+    std::lock_guard lock(impl_->mutex);
+    Impl::State& s = impl_->state;
     if (!s.open) {
         return true;
     }
@@ -843,7 +1194,9 @@ bool Mp4Writer::Close(std::wstring& error)
     }
 
     if (ok) {
-        ok = s.FlushFragment(error);
+        // Audio that arrived after the last keyframe goes out here too, in an
+        // audio-only fragment when no video is pending.
+        ok = s.FlushFragment(true, error);
     }
 
     if (ok) {
@@ -873,10 +1226,8 @@ bool Mp4Writer::Close(std::wstring& error)
     if (ok) {
         // mehd is patched last: until this point the file is a valid
         // fragmented MP4 with an unknown duration, which players handle.
-        const uint64_t duration_ms =
-            (s.decode_time * kMovieTimescale + kTrackTimescale / 2) / kTrackTimescale;
         Bytes value;
-        value.U64(duration_ms);
+        value.U64(s.DurationMs());
         LARGE_INTEGER at{};
         at.QuadPart = static_cast<LONGLONG>(s.mehd_value_offset);
         DWORD code = 0;
@@ -893,11 +1244,23 @@ bool Mp4Writer::Close(std::wstring& error)
     s.open = false;
     s.payload = {};
     s.sizes = {};
+    for (Impl::AudioTrack& track : s.audio) {
+        track.payload = {};
+        track.sizes = {};
+    }
     return ok;
 }
 
-uint64_t Mp4Writer::SampleCount() const { return impl_->sample_count; }
+uint64_t Mp4Writer::SampleCount() const
+{
+    std::lock_guard lock(impl_->mutex);
+    return impl_->state.sample_count;
+}
 
-uint64_t Mp4Writer::BytesWritten() const { return impl_->file_size; }
+uint64_t Mp4Writer::BytesWritten() const
+{
+    std::lock_guard lock(impl_->mutex);
+    return impl_->state.file_size;
+}
 
 } // namespace zcr

@@ -13,11 +13,25 @@
 // You should have received a copy of the GNU General Public License along with
 // this program. If not, see <https://www.gnu.org/licenses/>.
 
-// Muxes a raw HEVC Annex B elementary stream into fragmented MP4 through
-// Mp4Writer, so the container can be checked with ffprobe without a capture
-// session or an encoder in the loop.
+// Muxes a raw HEVC Annex B elementary stream, plus any number of ADTS AAC
+// streams, into fragmented MP4 through Mp4Writer, so the container can be
+// checked with ffprobe without a capture session or an encoder in the loop.
 //
 //   mux_test <in.hevc> <out.mp4> <fps> [--hdr] [--size WxH]
+//            [--aac <in.aac> [--aac-name NAME]]...
+//            [--order interleave|video-first|audio-first] [--threaded]
+//
+// Each --aac adds one audio track; --aac-name names the track given just
+// before it. The ADTS headers are stripped and the AudioSpecificConfig is
+// built from the first one.
+//
+// --order decides how audio reaches the writer. interleave (the default)
+// feeds every audio frame that starts at or before a video sample ahead of
+// that sample, the way capture delivers them. video-first writes all video
+// and then all audio, and audio-first the reverse; both pile up enough audio
+// to exercise the audio-only fragment and the flush on Close. --threaded
+// feeds each audio track from its own thread, unpaced, against the video on
+// the main thread, which exercises the writer's locking.
 
 #include "mp4mux.h"
 #include "win32.h"
@@ -25,6 +39,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace zcr {
@@ -135,10 +150,74 @@ struct NalRef {
     return units;
 }
 
+struct AacStream {
+    std::wstring path;
+    AudioTrackConfig config;
+    std::vector<std::vector<uint8_t>> frames; // raw, ADTS header removed
+};
+
+/// ISO/IEC 13818-7 ADTS. Every frame must repeat the first one's format,
+/// since the track has a single sample entry.
+[[nodiscard]] bool ParseAdts(const std::vector<uint8_t>& s, AacStream& out, std::wstring& error)
+{
+    static const uint32_t rates[13] = {96000, 88200, 64000, 48000, 44100, 32000, 24000,
+                                       22050, 16000, 12000, 11025, 8000,  7350};
+    uint32_t first_format = UINT32_MAX;
+    size_t payload_bytes = 0;
+    size_t i = 0;
+    while (i + 7 <= s.size()) {
+        const uint8_t* h = s.data() + i;
+        if (h[0] != 0xFF || (h[1] & 0xF0) != 0xF0) {
+            error = L"no ADTS syncword at byte " + std::to_wstring(i);
+            return false;
+        }
+        const bool crc = (h[1] & 0x01) == 0;
+        const uint32_t profile = h[2] >> 6;
+        const uint32_t rate_index = (h[2] >> 2) & 0x0F;
+        const uint32_t channels = ((h[2] & 0x01) << 2) | (h[3] >> 6);
+        const size_t length = (static_cast<size_t>(h[3] & 0x03) << 11)
+            | (static_cast<size_t>(h[4]) << 3) | (h[5] >> 5);
+        const uint32_t blocks = h[6] & 0x03;
+        const size_t header = crc ? 9 : 7;
+        if (rate_index >= 13 || channels == 0 || blocks != 0 || length <= header
+            || i + length > s.size()) {
+            error = L"unsupported or truncated ADTS frame at byte " + std::to_wstring(i);
+            return false;
+        }
+        const uint32_t frame_format = (profile << 8) | (rate_index << 4) | channels;
+        if (first_format == UINT32_MAX) {
+            first_format = frame_format;
+            const uint32_t object_type = profile + 1;
+            const uint32_t asc = (object_type << 11) | (rate_index << 7) | (channels << 3);
+            out.config.specific_config = {static_cast<uint8_t>(asc >> 8),
+                                          static_cast<uint8_t>(asc)};
+            out.config.sample_rate = rates[rate_index];
+            out.config.channels = channels;
+        } else if (frame_format != first_format) {
+            error = L"ADTS format changes at byte " + std::to_wstring(i);
+            return false;
+        }
+        out.frames.emplace_back(h + header, h + length);
+        payload_bytes += length - header;
+        i += length;
+    }
+    if (out.frames.empty()) {
+        error = L"no ADTS frames";
+        return false;
+    }
+    const double seconds = static_cast<double>(out.frames.size()) * 1024.0
+        / static_cast<double>(out.config.sample_rate);
+    out.config.avg_bitrate = static_cast<uint32_t>(static_cast<double>(payload_bytes) * 8.0 / seconds);
+    return true;
+}
+
 int Run(int argc, wchar_t** argv)
 {
     if (argc < 4) {
-        std::fwprintf(stderr, L"usage: mux_test <in.hevc> <out.mp4> <fps> [--hdr] [--size WxH]\n");
+        std::fwprintf(stderr,
+                      L"usage: mux_test <in.hevc> <out.mp4> <fps> [--hdr] [--size WxH]\n"
+                      L"                [--aac <in.aac> [--aac-name NAME]]...\n"
+                      L"                [--order interleave|video-first|audio-first] [--threaded]\n");
         return 2;
     }
 
@@ -146,10 +225,32 @@ int Run(int argc, wchar_t** argv)
     format.width = 1920;
     format.height = 1080;
     format.fps = static_cast<uint32_t>(std::wcstoul(argv[3], nullptr, 10));
+    std::vector<AacStream> aac;
+    std::wstring order = L"interleave";
+    bool threaded = false;
     for (int i = 4; i < argc; ++i) {
         const std::wstring arg = argv[i];
         if (arg == L"--hdr") {
             format.hdr = true;
+        } else if (arg == L"--aac" && i + 1 < argc) {
+            AacStream stream;
+            stream.path = argv[++i];
+            stream.config.name = L"Audio " + std::to_wstring(aac.size() + 1);
+            aac.push_back(std::move(stream));
+        } else if (arg == L"--aac-name" && i + 1 < argc) {
+            if (aac.empty()) {
+                std::fwprintf(stderr, L"--aac-name must follow --aac\n");
+                return 2;
+            }
+            aac.back().config.name = argv[++i];
+        } else if (arg == L"--order" && i + 1 < argc) {
+            order = argv[++i];
+            if (order != L"interleave" && order != L"video-first" && order != L"audio-first") {
+                std::fwprintf(stderr, L"bad --order\n");
+                return 2;
+            }
+        } else if (arg == L"--threaded") {
+            threaded = true;
         } else if (arg == L"--size" && i + 1 < argc) {
             unsigned w = 0;
             unsigned h = 0;
@@ -188,20 +289,99 @@ int Run(int argc, wchar_t** argv)
         }
     }
 
+    std::vector<AudioTrackConfig> audio;
+    for (AacStream& in : aac) {
+        std::vector<uint8_t> bytes;
+        if (!ReadWholeFile(in.path, bytes)) {
+            std::fwprintf(stderr, L"cannot read %ls\n", in.path.c_str());
+            return 1;
+        }
+        std::wstring why;
+        if (!ParseAdts(bytes, in, why)) {
+            std::fwprintf(stderr, L"%ls: %ls\n", in.path.c_str(), why.c_str());
+            return 1;
+        }
+        std::wprintf(L"%ls: %zu frames, %u Hz, %u ch, %u bps, \"%ls\"\n", in.path.c_str(),
+                     in.frames.size(), in.config.sample_rate, in.config.channels,
+                     in.config.avg_bitrate, in.config.name.c_str());
+        audio.push_back(in.config);
+    }
+
     Mp4Writer writer;
     std::wstring error;
-    if (!writer.Open(argv[2], format, parameter_sets, error)) {
+    if (!writer.Open(argv[2], format, parameter_sets, audio, error)) {
         std::fwprintf(stderr, L"Open: %ls\n", error.c_str());
         return 1;
     }
 
+    // Next frame to write, per audio track.
+    std::vector<size_t> next(aac.size(), 0);
+    auto feed_audio = [&](size_t t, size_t until, std::wstring& why) {
+        for (; next[t] < until && next[t] < aac[t].frames.size(); ++next[t]) {
+            const std::vector<uint8_t>& frame = aac[t].frames[next[t]];
+            if (!writer.WriteAudioFrame(t, frame.data(), frame.size(), why)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto feed_all_audio = [&] {
+        for (size_t t = 0; t < aac.size(); ++t) {
+            if (!feed_audio(t, SIZE_MAX, error)) {
+                std::fwprintf(stderr, L"WriteAudioFrame: %ls\n", error.c_str());
+                return false;
+            }
+        }
+        return true;
+    };
+
+    std::vector<std::thread> threads;
+    std::vector<std::wstring> thread_errors(aac.size());
+    std::vector<int> thread_ok(aac.size(), 1);
+    if (threaded) {
+        for (size_t t = 0; t < aac.size(); ++t) {
+            threads.emplace_back([&, t] {
+                thread_ok[t] = feed_audio(t, SIZE_MAX, thread_errors[t]) ? 1 : 0;
+            });
+        }
+    } else if (order == L"audio-first" && !feed_all_audio()) {
+        return 1;
+    }
+
     size_t keyframes = 0;
-    for (const AccessUnit& unit : units) {
+    for (size_t n = 0; n < units.size(); ++n) {
+        const AccessUnit& unit = units[n];
+        if (!threaded && order == L"interleave") {
+            for (size_t t = 0; t < aac.size(); ++t) {
+                // Frame k starts at k * 1024 / rate, sample n at n / fps; feed
+                // every frame whose start is not after this sample's.
+                const uint64_t rate = aac[t].config.sample_rate;
+                const size_t until = static_cast<size_t>(n * rate / (1024ull * format.fps)) + 1;
+                if (!feed_audio(t, until, error)) {
+                    std::fwprintf(stderr, L"WriteAudioFrame: %ls\n", error.c_str());
+                    return 1;
+                }
+            }
+        }
         keyframes += unit.keyframe ? 1 : 0;
         if (!writer.WriteSample(unit.bytes.data(), unit.bytes.size(), unit.keyframe, error)) {
             std::fwprintf(stderr, L"WriteSample: %ls\n", error.c_str());
             return 1;
         }
+    }
+
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    for (size_t t = 0; t < aac.size(); ++t) {
+        if (!thread_ok[t]) {
+            std::fwprintf(stderr, L"WriteAudioFrame (track %zu): %ls\n", t,
+                          thread_errors[t].c_str());
+            return 1;
+        }
+    }
+    if (!threaded && !feed_all_audio()) {
+        return 1;
     }
 
     if (!writer.Close(error)) {
@@ -211,6 +391,12 @@ int Run(int argc, wchar_t** argv)
     // A second Close must be a harmless no-op.
     if (!writer.Close(error)) {
         std::fwprintf(stderr, L"second Close: %ls\n", error.c_str());
+        return 1;
+    }
+    // Audio threads can outlive the file by a frame; that must be refused.
+    const uint8_t late[1] = {0};
+    if (!aac.empty() && writer.WriteAudioFrame(0, late, sizeof(late), error)) {
+        std::fwprintf(stderr, L"WriteAudioFrame after Close succeeded\n");
         return 1;
     }
 
