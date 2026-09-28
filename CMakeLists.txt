@@ -100,6 +100,7 @@ add_executable(zcr WIN32
     src/convert.cpp
     src/nvenc.cpp
     src/mp4mux.cpp
+    src/audio.cpp
     src/recorder.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/zcr.rc"
 )
@@ -132,7 +133,15 @@ target_link_libraries(zcr PRIVATE
     d3d11
     dxgi
     avrt        # AvSetMmThreadCharacteristicsW, MMCSS "Capture"
+    mfplat      # the AAC encoder; delay-loaded, see below
+    mfuuid
+    delayimp
 )
+
+# Windows N ships without Media Foundation. Delay-loading it keeps the exe
+# starting there, and the installer's pre_install hook running, with audio
+# reporting itself unavailable instead of the loader refusing the whole binary.
+target_link_options(zcr PRIVATE /DELAYLOAD:mfplat.dll)
 
 zcr_apply_warnings(zcr)
 zcr_apply_hardening(zcr)
@@ -153,5 +162,23 @@ target_include_directories(mux_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(mux_test PRIVATE user32 shell32 ole32 shlwapi pathcch)
 zcr_apply_warnings(mux_test)
 set_target_properties(mux_test PROPERTIES EXCLUDE_FROM_ALL ON)
+
+# ---------------------------------------------------------------------------
+# audio_test: captures desktop and microphone audio through AudioSource on its
+# own, without video, and writes each track to an ADTS file ffprobe can read.
+# ---------------------------------------------------------------------------
+add_executable(audio_test
+    tests/audio_test.cpp
+    src/audio.cpp
+    src/diag_log.cpp
+    src/win32.cpp
+)
+target_include_directories(audio_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_definitions(audio_test PRIVATE ZCR_VERSION_STRING="${ZCR_VERSION}")
+target_link_libraries(audio_test PRIVATE user32 shell32 ole32 shlwapi pathcch avrt
+                      mfplat mfuuid delayimp)
+target_link_options(audio_test PRIVATE /DELAYLOAD:mfplat.dll)
+zcr_apply_warnings(audio_test)
+set_target_properties(audio_test PROPERTIES EXCLUDE_FROM_ALL ON)
 
 message(STATUS "ZCR ${ZCR_VERSION}  hardening=${ZCR_HARDENING} werror=${ZCR_WERROR}")

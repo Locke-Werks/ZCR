@@ -35,11 +35,11 @@ jobs:
       - name: Build
         run: cmake --build --preset ci
 
-      # EXCLUDE_FROM_ALL, so the default build never compiles it. Built here so it
-      # does not rot. Not run: it needs an HEVC stream, and producing one needs
-      # NVENC, which a hosted runner does not have.
-      - name: Build mux_test
-        run: cmake --build --preset ci --target mux_test
+      # EXCLUDE_FROM_ALL, so the default build never compiles them. Built here so
+      # they do not rot. Not run: mux_test needs an HEVC stream, which needs
+      # NVENC, and audio_test needs audio endpoints; a hosted runner has neither.
+      - name: Build the test harnesses
+        run: cmake --build --preset ci --target mux_test audio_test
 
       # --config is required: the Visual Studio generator is multi-config, so the
       # install rule cannot infer which one to take.
