@@ -22,9 +22,14 @@ upgrade_code = "80b24eec-c158-4776-a3d0-bc841c230b7c"
 # User scope, so on-demand is correct rather than a shortcut: every write lands in
 # the user's own profile and HKCU, and an elevated install would only put them in
 # the wrong one.
+#
+# {LocalAppData}\Programs rather than {LocalPrograms}. That known folder does not
+# exist on a fresh profile until something creates it, and Forge v0.4.1 expands
+# a missing folder to an empty string, which would make the install dir "\ZCR"
+# at the root of the current drive. LocalAppData always exists.
 [install]
 scope     = "user"
-dir       = '{LocalPrograms}\ZCR'
+dir       = '{LocalAppData}\Programs\ZCR'
 elevation = "on-demand"
 
 [ui]

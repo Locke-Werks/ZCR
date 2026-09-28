@@ -154,6 +154,10 @@ jobs:
             Write-Host "::warning::--check-only exited $code, which is expected when the runner itself fails a preflight"
           }
 
+          # pwsh on Actions exits with the last native exit code, which would fail
+          # the step on the very case the warning above just excused.
+          exit 0
+
       - name: Publish
         shell: pwsh
         env:

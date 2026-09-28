@@ -113,3 +113,17 @@ jobs:
             --dev
           if ($LASTEXITCODE -ne 0) { throw "lwforge rejected installer.toml" }
           ./tools/lwforge.exe inspect dist/ZCR-Setup.exe | Select-Object -First 12
+
+      # The runner's profile is a fresh one, which is exactly where a known-folder
+      # token that resolves to nothing shows up: the dir comes out as "\ZCR".
+      - name: Check the install dir resolves
+        shell: pwsh
+        run: |
+          $report = & dist/ZCR-Setup.exe --check-only 2>&1 | Out-String
+          $report
+          $dir = [regex]::Match($report, '(?m)^install dir\s+(.+?)\s*$').Groups[1].Value
+          if ($dir -notmatch '^[A-Za-z]:\\.+\\Programs\\ZCR$') {
+            throw "install dir resolved to '$dir', not a path under the user's LocalAppData\Programs"
+          }
+          "install dir: $dir"
+          exit 0
